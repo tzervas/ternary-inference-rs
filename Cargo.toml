@@ -1,0 +1,57 @@
+[package]
+name = "ternary-inference-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+description = "GPU-accelerated inference engine for BitNet 1.58-bit ternary models"
+repository = "https://github.com/tzervas/ternary-inference-rs"
+keywords = ["bitnet", "ternary", "inference", "llm", "gpu"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+# Tensor operations — upstream candle (not qlora fork)
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9" }
+candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9" }
+
+# Model loading
+safetensors = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Tokenizer
+tokenizers = "0.21"
+
+# Error handling
+thiserror = "2"
+
+# f16 types for GPU matmul
+half = "2"
+
+# HuggingFace Hub download
+hf-hub = { version = "0.4", optional = true }
+
+# GPU compute (CubeCL for future custom kernels)
+cubecl = { version = "0.9", optional = true }
+cubecl-cuda = { version = "0.9", optional = true }
+
+# Logging
+log = "0.4"
+
+# Random sampling for generation
+rand = "0.8"
+
+# Filesystem paths
+dirs-next = "2.0"
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+cubecl-kernels = ["dep:cubecl", "dep:cubecl-cuda"]
+hf-hub = ["dep:hf-hub"]
+
+[dev-dependencies]
+criterion = "0.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+env_logger = "0.11"
