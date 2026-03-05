@@ -161,6 +161,39 @@ pub fn dequantize_weight(
         .map_err(Error::Tensor)
 }
 
+/// Dequantize a packed ternary weight with per-group scales and per-row offsets.
+///
+/// Asymmetric quantization: W_hat[row, col] = ternary[row, col] * scale[row, group] + offset[row]
+/// Used by PT2-LLM quantization which has both alpha (scale) and mu (offset) per row.
+pub fn dequantize_weight_with_offsets(
+    packed: &[u8],
+    scales: &[f32],
+    offsets: &[f32],
+    out_features: usize,
+    in_features: usize,
+    group_size: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let num_groups = in_features / group_size;
+
+    let ternary = unpack_ternary(packed, out_features, in_features)?;
+
+    let mut dequantized = vec![0.0f32; out_features * in_features];
+    for row in 0..out_features {
+        let offset = offsets[row];
+        for group in 0..num_groups {
+            let scale = scales[row * num_groups + group];
+            let base = row * in_features + group * group_size;
+            for k in 0..group_size {
+                dequantized[base + k] = ternary[base + k] * scale + offset;
+            }
+        }
+    }
+
+    Tensor::from_vec(dequantized, (out_features, in_features), device)
+        .map_err(Error::Tensor)
+}
+
 /// Dequantize a packed ternary weight with per-tensor scale (2-bit, row-packed).
 ///
 /// Used by microsoft/bitnet-b1.58-2B-4T where each projection has a single scale.

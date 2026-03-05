@@ -1,4 +1,9 @@
 /target
+/models/
+/.venv/
+/.pip-tmp/
+__pycache__/
+*.pyc
 *.swp
 *.swo
 *~

@@ -7,10 +7,12 @@
 //! Usage:
 //!   RUST_LOG=info cargo run --example generate --release --features cuda -- --gpu
 //!   RUST_LOG=info cargo run --example generate --release --features cuda -- --gpu --model qwen2-32b
+//!   RUST_LOG=info cargo run --example generate --release --features cuda -- --gpu --model-path models/qwen2-32b-ternary
 //!
 //! Options:
 //!   --gpu              Use CUDA GPU
 //!   --model <name>     Model preset: "bitnet-2b" (default), "qwen2-32b"
+//!   --model-path <dir> Load from local directory instead of HF cache
 //!   --temp <f32>       Sampling temperature (0.0 = greedy)
 //!   --max-tokens <n>   Maximum tokens to generate
 //!   <prompt>           Text prompt (positional)
@@ -18,7 +20,7 @@
 use candle_core::Device;
 use ternary_inference_rs::config::ModelConfig;
 use ternary_inference_rs::generate::{generate, load_tokenizer_from_hf_cache, GenerationConfig};
-use ternary_inference_rs::loader::{load_from_hf_cache, LoadMode};
+use ternary_inference_rs::loader::{load_from_dir, load_from_hf_cache, LoadMode};
 use ternary_inference_rs::model::TernaryModel;
 
 fn main() -> anyhow::Result<()> {
@@ -30,6 +32,7 @@ fn main() -> anyhow::Result<()> {
     let mut max_tokens = 256usize;
     let mut use_gpu = false;
     let mut model_name = String::from("bitnet-2b");
+    let mut model_path: Option<String> = None;
     let mut prompt = String::from("def fibonacci(n):");
     let mut i = 0;
     while i < args.len() {
@@ -46,6 +49,10 @@ fn main() -> anyhow::Result<()> {
             "--model" | "-m" => {
                 i += 1;
                 model_name = args[i].clone();
+            }
+            "--model-path" => {
+                i += 1;
+                model_path = Some(args[i].clone());
             }
             _ => {
                 prompt = args[i..].join(" ");
@@ -69,24 +76,56 @@ fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("Unknown model: {other}. Use 'bitnet-2b' or 'qwen2-32b'"),
     };
 
+    // If --model-path given, parse config from that directory
+    let config = if let Some(ref path) = model_path {
+        let config_path = std::path::Path::new(path).join("config.json");
+        if config_path.exists() {
+            let json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+            // Override group_size from quantization_config if present
+            let mut c = ModelConfig::from_hf_config(&json)?;
+            if let Some(qc) = json.get("quantization_config") {
+                if let Some(gs) = qc.get("group_size").and_then(|v| v.as_u64()) {
+                    c.group_size = gs as usize;
+                }
+            }
+            c
+        } else {
+            config
+        }
+    } else {
+        config
+    };
+
     let device = if use_gpu {
         Device::new_cuda(0)?
     } else {
         Device::Cpu
     };
 
-    println!("Model: {model_id}");
+    let display_name = model_path.as_deref().unwrap_or(model_id);
+    println!("Model: {display_name}");
     println!("Device: {device:?}");
     println!("Prompt: {prompt}");
     println!("Temperature: {temperature}");
     println!("Max tokens: {max_tokens}\n");
 
     println!("Loading tokenizer...");
-    let tokenizer = load_tokenizer_from_hf_cache(model_id)?;
+    let tokenizer = if let Some(ref path) = model_path {
+        let tok_path = std::path::Path::new(path).join("tokenizer.json");
+        tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
+    } else {
+        load_tokenizer_from_hf_cache(model_id)?
+    };
     println!("Tokenizer loaded ({} vocab)", tokenizer.get_vocab_size(false));
 
     println!("Loading model weights (packed mode)...");
-    let weights = load_from_hf_cache(model_id, &config, &device, LoadMode::Packed)?;
+    let weights = if let Some(ref path) = model_path {
+        load_from_dir(std::path::Path::new(path), &config, &device, LoadMode::Packed)?
+    } else {
+        load_from_hf_cache(model_id, &config, &device, LoadMode::Packed)?
+    };
     println!("Weights loaded: {} layers", weights.layers.len());
 
     println!("Initializing model...");

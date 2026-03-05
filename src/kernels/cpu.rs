@@ -15,11 +15,16 @@ use crate::unpack::unpack_byte;
 /// CPU ternary matrix multiplication without full dequantization.
 ///
 /// Computes output = input @ weight^T where weight is packed ternary.
+/// Supports optional per-row offsets for asymmetric quantization (PT2-LLM).
+///
+/// Without offsets: y[b,j] = sum_g (scale[j,g] * sum_k T[j,g*gs+k] * x[b,g*gs+k])
+/// With offsets:    y[b,j] = sum_g (scale[j,g] * sum_k T[j,g*gs+k] * x[b,g*gs+k]) + offset[j] * sum(x[b,:])
 ///
 /// # Arguments
 /// * `input` - Float tensor of shape [batch, in_features]
 /// * `packed_weight` - Packed bytes [out_features, in_features/4]
 /// * `scales` - Per-group scales [out_features, num_groups]
+/// * `offsets` - Optional per-row offsets [out_features] (PT2-LLM asymmetric)
 /// * `out_features` - Output dimension
 /// * `in_features` - Input dimension
 /// * `group_size` - Weights per scale group
@@ -27,6 +32,7 @@ pub fn ternary_matmul_cpu(
     input: &Tensor,
     packed_weight: &[u8],
     scales: &[f32],
+    offsets: Option<&[f32]>,
     out_features: usize,
     in_features: usize,
     group_size: usize,
@@ -45,6 +51,9 @@ pub fn ternary_matmul_cpu(
     for b in 0..batch_size {
         let x = &input_data[b * in_features..(b + 1) * in_features];
 
+        // Pre-compute sum(x) for offset term (only if offsets present)
+        let x_sum = offsets.map(|_| x.iter().sum::<f32>());
+
         for j in 0..out_features {
             let mut sum = 0.0f32;
 
@@ -59,18 +68,21 @@ pub fn ternary_matmul_cpu(
                     let vals = unpack_byte(byte);
                     let col = col_start + k_packed * 4;
 
-                    // Accumulate: ternary * input
-                    // Since ternary is {-1,0,+1}, this is just add/subtract/skip
                     for (di, &v) in vals.iter().enumerate() {
                         match v {
                             1 => group_sum += x[col + di],
                             -1 => group_sum -= x[col + di],
-                            _ => {} // 0: skip
+                            _ => {}
                         }
                     }
                 }
 
                 sum += scale * group_sum;
+            }
+
+            // Add offset contribution: offset[j] * sum(x)
+            if let (Some(offs), Some(xs)) = (offsets, x_sum) {
+                sum += offs[j] * xs;
             }
 
             output[b * out_features + j] = sum;
@@ -95,12 +107,30 @@ mod tests {
         let packed = vec![65u8, 25u8];
         let scales = vec![1.0f32, 1.0]; // identity scales
 
-        let result = ternary_matmul_cpu(&input, &packed, &scales, 2, 4, 4).unwrap();
+        let result = ternary_matmul_cpu(&input, &packed, &scales, None, 2, 4, 4).unwrap();
         let data: Vec<f32> = result.to_vec2().unwrap().into_iter().flatten().collect();
 
         // Row 0 dot: 1*1 + 2*(-1) + 3*0 + 4*1 = 1 - 2 + 0 + 4 = 3
         assert!((data[0] - 3.0).abs() < 1e-6, "got {}", data[0]);
         // Row 1 dot: 1*0 + 2*1 + 3*1 + 4*(-1) = 0 + 2 + 3 - 4 = 1
         assert!((data[1] - 1.0).abs() < 1e-6, "got {}", data[1]);
+    }
+
+    #[test]
+    fn test_ternary_matmul_with_offsets() {
+        // Same setup as above but with per-row offsets
+        let input = Tensor::new(&[[1.0f32, 2.0, 3.0, 4.0]], &Device::Cpu).unwrap();
+        let packed = vec![65u8, 25u8]; // same weights as above
+        let scales = vec![1.0f32, 1.0];
+        let offsets = vec![0.5f32, -0.5]; // per-row offsets
+
+        let result = ternary_matmul_cpu(&input, &packed, &scales, Some(&offsets), 2, 4, 4).unwrap();
+        let data: Vec<f32> = result.to_vec2().unwrap().into_iter().flatten().collect();
+
+        // sum(x) = 1 + 2 + 3 + 4 = 10
+        // Row 0: 3.0 + 0.5 * 10 = 8.0
+        assert!((data[0] - 8.0).abs() < 1e-6, "got {}", data[0]);
+        // Row 1: 1.0 + (-0.5) * 10 = -4.0
+        assert!((data[1] - (-4.0)).abs() < 1e-6, "got {}", data[1]);
     }
 }

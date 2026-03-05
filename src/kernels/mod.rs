@@ -33,6 +33,7 @@ pub fn ternary_matmul(
         input,
         packed_weight,
         scales,
+        None,
         out_features,
         in_features,
         group_size,
@@ -41,12 +42,13 @@ pub fn ternary_matmul(
     )
 }
 
-/// Perform ternary matmul with explicit packing format.
+/// Perform ternary matmul with explicit packing format and optional offsets.
 #[allow(clippy::too_many_arguments)]
 pub fn ternary_matmul_fmt(
     input: &Tensor,
     packed_weight: &[u8],
     scales: &[f32],
+    offsets: Option<&[f32]>,
     out_features: usize,
     in_features: usize,
     group_size: usize,
@@ -59,6 +61,7 @@ pub fn ternary_matmul_fmt(
                 input,
                 packed_weight,
                 scales,
+                offsets,
                 out_features,
                 in_features,
                 group_size,

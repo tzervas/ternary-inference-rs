@@ -34,6 +34,9 @@ pub struct PackedProjection {
     pub packed: Vec<u8>,
     /// Scale factors: per-group [out_features * num_groups] or per-tensor [1]
     pub scales: Vec<f32>,
+    /// Per-row offsets (PT2-LLM asymmetric quantization): [out_features]
+    /// When present: W_hat = alpha * T + mu (instead of just alpha * T)
+    pub offsets: Option<Vec<f32>>,
     /// Output dimension
     pub out_features: usize,
     /// Input dimension
@@ -282,11 +285,20 @@ pub fn load_from_dir(
                     return Err(Error::Loading(format!("missing scales for {weight_key}")));
                 };
 
+                // Get offsets (PT2-LLM asymmetric quantization, optional)
+                let offset_key = format!("{pfx}.{proj_key}.weight.offsets");
+                let offsets: Option<Vec<f32>> = float_tensors.get(&offset_key).map(|t| {
+                    t.flatten_all()
+                        .and_then(|t| t.to_vec1())
+                        .unwrap_or_default()
+                });
+
                 match mode {
                     LoadMode::Packed => Ok((
                         Some(PackedProjection {
                             packed: packed_bytes.clone(),
                             scales,
+                            offsets,
                             out_features,
                             in_features,
                             format: packing_format,

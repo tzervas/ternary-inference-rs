@@ -310,6 +310,7 @@ fn project(
             &flat,
             &p.packed,
             &p.scales,
+            p.offsets.as_deref(),
             p.out_features,
             p.in_features,
             group_size,
