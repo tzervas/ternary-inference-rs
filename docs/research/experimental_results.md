@@ -29,6 +29,37 @@ cross-column error propagation is essential for ternary PTQ.
 | GPTQ + SSR | 581 | 44x | Column reordering helps 28% |
 | **GPTQ + Hadamard** | **546** | **41x** | Best result, all layers GPTQ wins |
 
+### Pythia-2.8B (2560 hidden, 32 layers)
+
+| Method | Quant PPL | Ratio | Notes |
+|--------|-----------|-------|-------|
+| Baseline (FP16) | 10.23 | 1.0x | |
+| **GPTQ + Hadamard + SSR** | **329** | **32x** | 120/120 layers GPTQ wins, SNR 5.8-6.9 dB |
+
+### Pythia-6.9B (4096 hidden, 32 layers)
+
+| Method | Quant PPL | Ratio | Notes |
+|--------|-----------|-------|-------|
+| Baseline (FP16) | 9.31 | 1.0x | |
+| **GPTQ + Hadamard + SSR** | **665** | **71x** | Worse than 2.8B despite better per-weight SNR |
+
+**Key insight**: Scaling trend reverses at 6.9B. Per-weight SNR is slightly better
+(6.4 dB mean vs 6.3 dB for 2.8B), but total error accumulation from 6B quantized
+params (vs 2.4B) overwhelms the redundancy benefit. Same 32 layers but 2.5x more
+params per layer.
+
+### Phi-2 (2560 hidden, 32 layers, PhiForCausalLM)
+
+| Method | Quant PPL | Ratio | Notes |
+|--------|-----------|-------|-------|
+| Baseline (FP16) | 9.81 | 1.0x | |
+| **GPTQ + Hadamard + SSR** | **98.8** | **10x** | 3x better than Pythia-2.8B (similar size!) |
+
+**Key insight**: Architecture matters far more than model size! Phi-2 (2.7B) achieves
+10x ratio vs Pythia-2.8B's 32x, with essentially the same dimensions (2560 hidden,
+10240 intermediate, 32 layers). Phi's architecture is significantly more
+quantization-friendly.
+
 ## Key Findings (Updated)
 
 ### 1. GPTQ Is Working Correctly
@@ -57,10 +88,12 @@ making the weight distribution more uniform before quantization. This gives
 PT2-LLM's Structural Similarity Reordering groups similar columns before
 GPTQ block processing. Worth ~28% improvement on Pythia-1B.
 
-### 6. Model Scale Matters Enormously
-- Pythia-160M: 131x PPL ratio (best config)
-- Pythia-1B: 41x PPL ratio (best config)
-- Trend suggests 7B+ models would have much better ratios
+### 6. Architecture Matters More Than Scale
+- Pythia-160M: 131x, Pythia-1B: 41x, Pythia-2.8B: 32x, Pythia-6.9B: 71x
+- **Phi-2 (2.7B): 10x** — same dimensions as Pythia-2.8B but 3x better ratio!
+- Architecture is the dominant factor, not just parameter count
+- GPT-NeoX (Pythia) may have inherent quantization sensitivity
+- LLaMA, Phi, and other architectures likely much more quantization-friendly
 
 ## PT2-LLM Paper Reference (ICLR 2026)
 
@@ -76,15 +109,17 @@ based on the paper description of ITF + AGA + GPTQ + SSR.
 
 ## Remaining Gap Analysis
 
-Our best (41x on Pythia-1B) vs PT2-LLM (2x on LLaMA-7B):
-1. **Scale**: 1B vs 7B (larger models are more redundant)
-2. **Architecture**: LLaMA vs Pythia (LLaMA may be more quantization-friendly)
-3. **LLaMA-3-8B gets 5.2x** ratio, much worse than LLaMA-7B's 2x
-4. Our GPTQ may still have room for improvement
+Our best (32x on Pythia-2.8B) vs PT2-LLM (2x on LLaMA-7B):
+1. **Architecture gap**: LLaMA is likely more quantization-friendly than Pythia
+2. **LLaMA-3-8B gets 5.2x** in PT2-LLM paper, much worse than LLaMA-7B's 2x
+3. **Pythia-6.9B regression** (71x) shows total error accumulation is critical
+4. Our implementation likely differs from PT2-LLM in calibration/error management
+5. Need to test on LLaMA-7B directly for fair comparison
 
 ## Next Steps
 
 1. Test on LLaMA-7B to compare directly against paper claims
-2. Test on Pythia-2.8B to validate scaling trend
+2. Test on different architectures (Mistral, Qwen, Gemma) for generality
 3. Consider PTQTP (dual trit-plane, ~3 bits) for better quality
 4. Investigate weight distribution transformation (DBellQuant approach)
+5. Publish successful quantizations to HuggingFace under tzervas/
