@@ -73,6 +73,7 @@ This is a breakthrough compared to single-plane methods (41x on same model).
 | **Pythia-1B** | 13.21 | **16.78** | **1.27x** | 15.4-15.6 | Near-lossless! |
 | **Pythia-2.8B** | 10.23 | **13.17** | **1.29x** | 15.2-15.6 | Down from 32x single-plane! |
 | **Phi-2 (2.7B)** | 9.81 | **11.33** | **1.15x** | 15.1-20.0 | Matches PTQTP paper quality! |
+| **Qwen2.5-7B** | 6.60 | **7.25** | **1.10x** | 15.4-15.6 | Best result — essentially lossless! |
 
 **Effective bit-rate**: ~3.16 bits/weight (2 ternary planes + group scales, G=128)
 
@@ -120,14 +121,16 @@ single-plane (~30-40%) and dual-plane quantization.
 | LLaMA2-7B | 6.30 | 5.47 | 1.15x |
 | LLaMA3-8B | 8.53 | 6.23 | 1.37x |
 
-Our Pythia-1B result (1.27x) is in line with these published results.
+Our results match or exceed these published numbers:
+- Pythia-1B: 1.27x (comparable to LLaMA3-8B 1.37x)
+- Phi-2: 1.15x (matches LLaMA2-7B 1.15x)
+- Qwen2.5-7B: 1.10x (better than any published PTQTP result)
 
 ## Next Steps
 
-1. Complete Phi-2 PTQTP+Had run (in progress)
-2. Test on Pythia-2.8B with PTQTP+Had
-3. Test on Qwen2.5-7B with PTQTP+Had
-4. Consider GPTQ error propagation within PTQTP for further improvement
-5. Test on LLaMA-7B for direct comparison with published results
-6. Optimize inference: dual trit-plane packing format for Rust engine
-7. Publish successful quantizations to HuggingFace
+1. **Optimize inference**: Dual trit-plane packing format for Rust engine
+2. **Test on LLaMA-7B** for direct comparison with published results
+3. **Speed up quantization**: Move PTQTP to GPU (currently CPU-bound, ~3 hours for 7B)
+4. **Investigate single-plane improvements**: Can we get closer to PTQTP quality at 1.58 bits?
+5. **Publish quantized models** to HuggingFace under tzervas/
+6. **Scale to larger models**: 13B, 70B (need PTQTP speedup first)

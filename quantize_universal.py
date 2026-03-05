@@ -659,8 +659,18 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
     skip_patterns = ["embed", "lm_head", "head"]
     linear_layers = []
     skipped = []
+    def _is_linear(m):
+        """Check if module is a linear layer (including BnB 4-bit)."""
+        if isinstance(m, nn.Linear):
+            return True
+        try:
+            import bitsandbytes as bnb
+            return isinstance(m, (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt))
+        except ImportError:
+            return False
+
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
+        if _is_linear(module):
             if any(p in name.lower() for p in skip_patterns):
                 skipped.append(name)
             elif skip_first_last and _is_first_or_last_layer(name, model):
@@ -672,13 +682,56 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
         log.info(f"Skipping {len(skipped)} sensitive layers: {skipped}")
     log.info(f"Found {len(linear_layers)} linear layers to quantize sequentially")
 
+    def _replace_weight(model, name, module, W_hat):
+        """Replace module weight, handling BnB 4-bit by converting to nn.Linear."""
+        try:
+            import bitsandbytes as bnb
+            is_4bit = isinstance(module, (bnb.nn.Linear4bit, bnb.nn.Linear8bitLt))
+        except ImportError:
+            is_4bit = False
+
+        if is_4bit:
+            # Replace BnB module with standard nn.Linear
+            out_f, in_f = W_hat.shape
+            bias = module.bias is not None
+            dev = next(module.parameters()).device
+            # Match the dtype used by the model's non-quantized layers
+            compute_dtype = torch.bfloat16  # Most HF models use bf16
+            new_linear = nn.Linear(in_f, out_f, bias=bias, device='cpu',
+                                   dtype=compute_dtype)
+            new_linear.weight.data = W_hat.to(compute_dtype).to(dev)
+            new_linear = new_linear.to(dev)
+            if bias:
+                new_linear.bias.data = module.bias.data.to(compute_dtype).to(dev)
+            # Replace in model
+            parts = name.rsplit('.', 1)
+            if len(parts) == 2:
+                parent = dict(model.named_modules())[parts[0]]
+                setattr(parent, parts[1], new_linear)
+            else:
+                setattr(model, name, new_linear)
+            return new_linear
+        else:
+            module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
+            return module
+
     stats_all = []
     for layer_idx, (name, module) in enumerate(linear_layers):
         # Capture Hessian through the partially-quantized model
         H = capture_layer_hessian(model, name, module, samples, device,
                                   n_samples=n_hessian_samples)
 
-        W = module.weight.data.float().cpu()
+        # Extract weight - handle BnB 4-bit quantized weights
+        try:
+            import bitsandbytes as bnb
+            if hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
+                W = bnb.functional.dequantize_4bit(
+                    module.weight.data, module.weight.quant_state
+                ).float().cpu()
+            else:
+                W = module.weight.data.float().cpu()
+        except (ImportError, AttributeError):
+            W = module.weight.data.float().cpu()
         out_f, in_f = W.shape
 
         # Pad to multiple of 4 for packing
@@ -729,7 +782,7 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
             snr_aga = best_snr
             snr_gptq = None
 
-            module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
+            _replace_weight(model, name, module, W_hat)
         else:
             # PT2-LLM pipeline: ITF + AGA + GPTQ
             # Optional: Hadamard rotation for incoherence processing
@@ -791,7 +844,7 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
                 # Un-rotate: W_hat_orig = W_hat_rot @ R (since W_rot = W @ R^T)
                 W_hat = W_hat @ R
             W_hat = W_hat[:out_f, :in_f]
-            module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
+            _replace_weight(model, name, module, W_hat)
 
         stats = {
             "name": name,
@@ -882,7 +935,7 @@ def main():
         from transformers import BitsAndBytesConfig
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
         )
         model = AutoModelForCausalLM.from_pretrained(
