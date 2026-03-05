@@ -38,6 +38,60 @@ log = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Hadamard Rotation (QuIP#-style preprocessing)
+# ============================================================================
+
+def hadamard_matrix(n):
+    """Generate normalized Hadamard-like orthogonal matrix of size n."""
+    # Use randomized Hadamard: H = D @ Had @ P where D is random signs,
+    # Had is Walsh-Hadamard, P is random permutation.
+    # For non-power-of-2, we use a random orthogonal matrix.
+    if n & (n - 1) == 0 and n > 0:  # power of 2
+        # Walsh-Hadamard via recursive construction
+        H = torch.tensor([[1.0]])
+        while H.shape[0] < n:
+            H = torch.cat([
+                torch.cat([H, H], dim=1),
+                torch.cat([H, -H], dim=1),
+            ], dim=0)
+        return H / math.sqrt(n)
+    else:
+        # Random orthogonal via QR decomposition
+        Q, _ = torch.linalg.qr(torch.randn(n, n))
+        return Q
+
+
+def apply_hadamard_rotation(W, H_hessian, seed=42):
+    """
+    Apply Hadamard rotation to weight columns and Hessian.
+    W' = W @ R^T,  H' = R @ H @ R^T
+    Returns: W_rotated, H_rotated, R
+    """
+    in_f = W.shape[1]
+    torch.manual_seed(seed)
+
+    # For large matrices, use block-diagonal Hadamard for efficiency
+    if in_f > 2048:
+        block_size = 256
+        R = torch.zeros(in_f, in_f)
+        for i in range(0, in_f, block_size):
+            end = min(i + block_size, in_f)
+            bs = end - i
+            R[i:end, i:end] = hadamard_matrix(bs)
+    else:
+        R = hadamard_matrix(in_f)
+
+    # Apply random sign flips for additional incoherence
+    signs = (torch.randint(0, 2, (in_f,)) * 2 - 1).float()
+    R = R * signs.unsqueeze(0)
+
+    W_rot = W @ R.T
+    H_rot = R @ H_hessian @ R.T
+
+    return W_rot, H_rot, R
+
+
+# ============================================================================
 # PT2-LLM Core: ITF + AGA
 # ============================================================================
 
@@ -128,44 +182,110 @@ def activation_aware_alignment(W, T, H, itf_alpha=None, itf_mu=None):
     return alpha, mu
 
 
-def gptq_ternary(W, H, block_size=128):
-    """GPTQ-style error compensation for ternary quantization."""
+def _ssr_select_block(W_remaining, block_size):
+    """
+    SSR: Structural Similarity-based Reordering.
+    From remaining columns, select the top-k most similar to the mean reference.
+    Returns indices into the remaining columns.
+    """
+    n_remaining = W_remaining.shape[1]
+    if n_remaining <= block_size:
+        return list(range(n_remaining))
+
+    # Mean reference vector
+    w_mean = W_remaining.mean(dim=1)  # [out_f]
+    w_mean_norm = w_mean.norm()
+    if w_mean_norm < 1e-10:
+        return list(range(block_size))
+
+    # Cosine similarity between each column and the mean
+    col_norms = W_remaining.norm(dim=0)  # [n_remaining]
+    similarities = (W_remaining.T @ w_mean) / (col_norms * w_mean_norm).clamp(min=1e-10)
+
+    # Select top-k most similar columns
+    _, indices = similarities.abs().topk(block_size)
+    return indices.sort().values.tolist()
+
+
+def gptq_ternary(W, H, block_size=128, use_ssr=True):
+    """
+    GPTQ-style error compensation for ternary quantization with SSR.
+
+    Pipeline: ITF → GPTQ with SSR column reordering → re-optimize (alpha, mu)
+
+    SSR (Structural Similarity Reordering): before each GPTQ block, select
+    the top-k columns most similar to the mean of remaining columns. This
+    clusters outliers together, preventing them from distorting normal columns.
+    """
     out_f, in_f = W.shape
-    W = W.clone()
     W_orig = W.clone()
 
+    # Prepare Hessian inverse
     damp = 0.01 * H.diagonal().mean()
-    H = H.clone()
-    H.diagonal().add_(damp)
+    H_work = H.clone()
+    H_work.diagonal().add_(damp)
 
     try:
-        L = torch.linalg.cholesky(H)
+        L = torch.linalg.cholesky(H_work)
         H_inv = torch.cholesky_inverse(L)
     except Exception:
-        H.diagonal().add_(damp * 10)
+        H_work.diagonal().add_(damp * 10)
         try:
-            L = torch.linalg.cholesky(H)
+            L = torch.linalg.cholesky(H_work)
             H_inv = torch.cholesky_inverse(L)
         except Exception:
+            log.warning("GPTQ: Cholesky failed, falling back to ITF")
             return iterative_ternary_fitting(W, n_iters=10)
+
+    # SSR: Build column processing order
+    if use_ssr:
+        # Build the full permutation by iteratively selecting blocks
+        perm = []
+        remaining = list(range(in_f))
+        W_work = W.clone()
+        while len(remaining) > 0:
+            k = min(block_size, len(remaining))
+            W_rem = W_work[:, remaining]
+            block_local_idx = _ssr_select_block(W_rem, k)
+            block_global_idx = [remaining[i] for i in block_local_idx]
+            perm.extend(block_global_idx)
+            for idx in sorted(block_local_idx, reverse=True):
+                remaining.pop(idx)
+
+        perm = torch.tensor(perm, dtype=torch.long)
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(in_f)
+
+        # Permute W and H
+        W = W_orig[:, perm].clone()
+        H_inv = H_inv[perm][:, perm]
+    else:
+        W = W_orig.clone()
+        perm = None
 
     T = torch.zeros(out_f, in_f, dtype=torch.int8)
 
+    # Initial per-row (alpha, mu) from ITF
+    _, alpha_cur, mu_cur = iterative_ternary_fitting(W, n_iters=10)
+
+    # Process columns in blocks
     for col_start in range(0, in_f, block_size):
         col_end = min(col_start + block_size, in_f)
         block_cols = col_end - col_start
         H_inv_block = H_inv[col_start:col_end, col_start:col_end]
 
         err_block = torch.zeros(out_f, block_cols, dtype=W.dtype)
+
         for j in range(block_cols):
             col_idx = col_start + j
             w_col = W[:, col_idx]
             h_jj = H_inv_block[j, j].clamp(min=1e-10)
 
-            scale = w_col.abs().mean().clamp(min=1e-10)
-            q_col = (w_col / scale).round().clamp(-1, 1)
-            T[:, col_idx] = q_col.to(torch.int8)
-            err = (w_col - q_col * scale) / h_jj
+            t_col = ((w_col - mu_cur) / alpha_cur.clamp(min=1e-10)).round().clamp(-1, 1)
+            T[:, col_idx] = t_col.to(torch.int8)
+
+            w_hat_col = alpha_cur * t_col + mu_cur
+            err = (w_col - w_hat_col) / h_jj
             err_block[:, j] = err
 
             if j + 1 < block_cols:
@@ -173,11 +293,25 @@ def gptq_ternary(W, H, block_size=128):
                     err.unsqueeze(1) * H_inv_block[j, j + 1:].unsqueeze(0)
                 )
 
+        # Inter-block propagation
         if col_end < in_f:
             H_inv_cross = H_inv[col_start:col_end, col_end:]
             W[:, col_end:] -= err_block @ H_inv_cross
 
-    # Compute optimal (alpha, mu) for the GPTQ T against original W
+            # Re-run ITF on remaining modified columns
+            W_remaining = W[:, col_end:]
+            if W_remaining.shape[1] >= 4:
+                _, alpha_rem, mu_rem = iterative_ternary_fitting(
+                    W_remaining, n_iters=5
+                )
+                alpha_cur = alpha_rem
+                mu_cur = mu_rem
+
+    # Un-permute T back to original column order
+    if perm is not None:
+        T = T[:, inv_perm]
+
+    # Re-compute optimal (alpha, mu) for the final T against original W
     T_f = T.float()
     m = float(in_f)
     TT_sum = (T_f * T_f).sum(dim=1)
@@ -189,6 +323,56 @@ def gptq_ternary(W, H, block_size=128):
     mu = (TT_sum * W_sum - T_sum * WT_sum) / denom
     alpha = alpha.clamp(min=0)
 
+    return T, alpha, mu
+
+
+def greedy_bitflip(W, T, alpha, mu, H, n_iters=3):
+    """
+    Greedy bit-flip optimization: find elements where flipping the ternary
+    value reduces activation-weighted error. Fully vectorized.
+
+    For each element (i,j), tries all 3 ternary values and picks the best.
+    Uses diagonal approximation of H for speed (full H would be O(n^2) per flip).
+    """
+    T_f = T.float().clone()
+    out_f, in_f = W.shape
+    h_diag = H.diagonal().unsqueeze(0)  # [1, in_f]
+
+    for iteration in range(n_iters):
+        W_hat = alpha.unsqueeze(1) * T_f + mu.unsqueeze(1)
+        E = W - W_hat  # [out_f, in_f]
+        cur_err_sq = E ** 2 * h_diag  # [out_f, in_f]
+
+        best_val = T_f.clone()
+        best_err = cur_err_sq.clone()
+
+        for new_val in [-1.0, 0.0, 1.0]:
+            new_w_hat = alpha.unsqueeze(1) * new_val + mu.unsqueeze(1)
+            new_err = W - new_w_hat
+            new_err_sq = new_err ** 2 * h_diag
+            better = new_err_sq < best_err
+            best_val = torch.where(better, torch.tensor(new_val), best_val)
+            best_err = torch.where(better, new_err_sq, best_err)
+
+        changed = (best_val != T_f)
+        n_flips = changed.sum().item()
+        if n_flips == 0:
+            break
+
+        T_f = best_val
+
+        # Re-optimize alpha, mu
+        m = float(in_f)
+        TT_sum = (T_f * T_f).sum(dim=1)
+        WT_sum = (W * T_f).sum(dim=1)
+        T_sum = T_f.sum(dim=1)
+        W_sum = W.sum(dim=1)
+        denom = (m * TT_sum - T_sum ** 2).clamp(min=1e-10)
+        alpha = (m * WT_sum - T_sum * W_sum) / denom
+        mu = (TT_sum * W_sum - T_sum * WT_sum) / denom
+        alpha = alpha.clamp(min=0)
+
+    T = T_f.to(torch.int8)
     return T, alpha, mu
 
 
@@ -232,14 +416,11 @@ def evaluate_perplexity(model, tokenizer, device, max_samples=40, seq_len=2048):
 
 
 # ============================================================================
-# Calibration + Hessian Capture
+# Calibration Data
 # ============================================================================
 
-def capture_hessians(model, tokenizer, device, n_samples=128, seq_len=2048):
-    """
-    Capture per-linear-layer Hessians (X^T @ X) from calibration data.
-    Returns dict: {module_name: Hessian_tensor}.
-    """
+def get_calibration_samples(tokenizer, n_samples=128, seq_len=2048):
+    """Load calibration samples from Wikitext2 train set."""
     dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
     text = "\n\n".join([t for t in dataset["text"] if len(t) > 100])
     tokens = tokenizer.encode(text, return_tensors="pt", truncation=False)[0]
@@ -250,69 +431,93 @@ def capture_hessians(model, tokenizer, device, n_samples=128, seq_len=2048):
     for i in range(n_samples):
         start = i * seq_len
         samples.append(tokens[start:start + seq_len].unsqueeze(0))
+    return samples
 
-    # Find all linear layers
-    linear_layers = {}
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            linear_layers[name] = module
 
-    log.info(f"Found {len(linear_layers)} linear layers to quantize")
+def capture_layer_hessian(model, layer_name, module, samples, device, n_samples=32):
+    """
+    Capture Hessian for a single layer by running calibration through
+    the (partially quantized) model. Uses fewer samples for speed since
+    we call this once per layer.
+    """
+    in_features = module.in_features
+    H = torch.zeros(in_features, in_features, dtype=torch.float32, device='cpu')
+    count = [0]
 
-    # Register hooks to accumulate H = X^T @ X
-    hessians = {}
-    n_tokens_per_layer = {}
-    hooks = []
+    def hook_fn(mod, input, output):
+        x = input[0].detach().float()
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
+        x_cpu = x.cpu()
+        H.add_(x_cpu.T @ x_cpu)
+        count[0] += x_cpu.shape[0]
 
-    def make_hook(layer_name, in_features):
-        H = torch.zeros(in_features, in_features, dtype=torch.float32, device='cpu')
-        count = [0]
+    hook = module.register_forward_hook(hook_fn)
 
-        def hook_fn(module, input, output):
-            x = input[0].detach().float()
-            if x.dim() == 3:
-                x = x.reshape(-1, x.shape[-1])
-            # Accumulate on CPU to save VRAM
-            x_cpu = x.cpu()
-            H.add_(x_cpu.T @ x_cpu)
-            count[0] += x_cpu.shape[0]
-
-        hessians[layer_name] = H
-        n_tokens_per_layer[layer_name] = count
-        return hook_fn
-
-    for name, module in linear_layers.items():
-        hook = module.register_forward_hook(make_hook(name, module.in_features))
-        hooks.append(hook)
-
-    log.info(f"Running {n_samples} calibration samples...")
     model.eval()
     with torch.no_grad():
-        for i, sample in enumerate(samples):
+        for i, sample in enumerate(samples[:n_samples]):
             sample = sample.to(device)
             model(sample)
-            if (i + 1) % 32 == 0:
-                log.info(f"  Calibration: {i+1}/{n_samples}")
 
-    for h in hooks:
-        h.remove()
-
-    log.info("Calibration complete")
-    return hessians, linear_layers
+    hook.remove()
+    return H
 
 
 # ============================================================================
-# Quantize + Replace
+# Sequential Layer-by-Layer Quantization
 # ============================================================================
 
-def quantize_and_replace(model, hessians, linear_layers, use_gptq=True):
+def _is_first_or_last_layer(name, model):
+    """Check if a linear layer belongs to the first or last transformer layer."""
+    # Common naming patterns: layers.0, layers.N-1, h.0, h.N-1
+    import re
+    match = re.search(r'layers?\.(\d+)', name)
+    if match:
+        layer_idx = int(match.group(1))
+        # Find max layer index
+        max_idx = 0
+        for n, _ in model.named_modules():
+            m = re.search(r'layers?\.(\d+)', n)
+            if m:
+                max_idx = max(max_idx, int(m.group(1)))
+        return layer_idx == 0 or layer_idx == max_idx
+    return False
+
+
+def quantize_sequential(model, tokenizer, device, use_gptq=True,
+                        n_calib=128, seq_len=2048, n_hessian_samples=32,
+                        skip_first_last=False, use_hadamard=False):
     """
-    Quantize all linear layers in-place using PT2-LLM.
-    Replaces nn.Linear with a ternary-quantized version.
+    Quantize layers SEQUENTIALLY: after quantizing layer i, the Hessian
+    for layer i+1 is captured through the already-quantized layers.
+    This naturally adapts to accumulated quantization error.
     """
+    samples = get_calibration_samples(tokenizer, n_calib, seq_len)
+
+    # Find all linear layers in order, skip embedding/lm_head
+    skip_patterns = ["embed", "lm_head", "head"]
+    linear_layers = []
+    skipped = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if any(p in name.lower() for p in skip_patterns):
+                skipped.append(name)
+            elif skip_first_last and _is_first_or_last_layer(name, model):
+                skipped.append(name)
+            else:
+                linear_layers.append((name, module))
+
+    if skipped:
+        log.info(f"Skipping {len(skipped)} sensitive layers: {skipped}")
+    log.info(f"Found {len(linear_layers)} linear layers to quantize sequentially")
+
     stats_all = []
+    for layer_idx, (name, module) in enumerate(linear_layers):
+        # Capture Hessian through the partially-quantized model
+        H = capture_layer_hessian(model, name, module, samples, device,
+                                  n_samples=n_hessian_samples)
 
-    for name, module in linear_layers.items():
         W = module.weight.data.float().cpu()
         out_f, in_f = W.shape
 
@@ -321,58 +526,66 @@ def quantize_and_replace(model, hessians, linear_layers, use_gptq=True):
             pad = 4 - (in_f % 4)
             W = torch.nn.functional.pad(W, (0, pad))
 
-        H = hessians.get(name)
+        # Pad Hessian if needed
+        h_dim = H.shape[0]
+        w_in = W.shape[1]
+        if h_dim < w_in:
+            H_padded = torch.zeros(w_in, w_in)
+            H_padded[:h_dim, :h_dim] = H
+            H_padded[h_dim:, h_dim:] = torch.eye(w_in - h_dim)
+            H_use = H_padded
+        elif h_dim > w_in:
+            H_use = H[:w_in, :w_in]
+        else:
+            H_use = H
+
+        # Optional: Hadamard rotation for incoherence processing
+        R = None
+        W_q = W  # weight to quantize (possibly rotated)
+        H_q = H_use  # Hessian for quantization (possibly rotated)
+        if use_hadamard:
+            W_q, H_q, R = apply_hadamard_rotation(W, H_use, seed=42 + layer_idx)
 
         # Step 1: ITF
-        T, alpha, mu = iterative_ternary_fitting(W, n_iters=10)
-        snr_itf = compute_snr(W, T, alpha, mu)
+        T, alpha, mu = iterative_ternary_fitting(W_q, n_iters=10)
+        snr_itf = compute_snr(W_q, T, alpha, mu)
 
-        # Step 2: AGA (if Hessian available)
-        if H is not None:
-            # Pad Hessian if needed
-            h_dim = H.shape[0]
-            w_in = W.shape[1]
-            if h_dim < w_in:
-                H_padded = torch.zeros(w_in, w_in)
-                H_padded[:h_dim, :h_dim] = H
-                H_padded[h_dim:, h_dim:] = torch.eye(w_in - h_dim)
-                H_use = H_padded
-            elif h_dim > w_in:
-                H_use = H[:w_in, :w_in]
-            else:
-                H_use = H
+        # Step 2: AGA
+        alpha, mu = activation_aware_alignment(W_q, T, H_q, itf_alpha=alpha, itf_mu=mu)
+        snr_aga = compute_snr(W_q, T, alpha, mu)
 
-            alpha, mu = activation_aware_alignment(W, T, H_use, itf_alpha=alpha, itf_mu=mu)
-            snr_aga = compute_snr(W, T, alpha, mu)
-        else:
-            snr_aga = snr_itf
-            H_use = None
-
-        # Step 3: GPTQ (if enabled and Hessian available)
+        # Step 3: GPTQ
         best_T, best_alpha, best_mu = T, alpha, mu
         best_snr = snr_aga
 
-        if use_gptq and H_use is not None:
-            T_g, alpha_g, mu_g = gptq_ternary(W, H_use)
-            # AGA on GPTQ result (with GPTQ values as fallback)
-            alpha_g, mu_g = activation_aware_alignment(W, T_g, H_use, itf_alpha=alpha_g, itf_mu=mu_g)
-            snr_gptq = compute_snr(W, T_g, alpha_g, mu_g)
+        if use_gptq:
+            T_g, alpha_g, mu_g = gptq_ternary(W_q, H_q)
+            alpha_g, mu_g = activation_aware_alignment(W_q, T_g, H_q,
+                                                       itf_alpha=alpha_g, itf_mu=mu_g)
+            snr_gptq = compute_snr(W_q, T_g, alpha_g, mu_g)
 
-            if snr_gptq > best_snr:
+            err_itf = compute_weighted_error(W_q, T, alpha, mu, H_q)
+            err_gptq = compute_weighted_error(W_q, T_g, alpha_g, mu_g, H_q)
+
+            if err_gptq < err_itf:
                 best_T, best_alpha, best_mu = T_g, alpha_g, mu_g
                 best_snr = snr_gptq
                 method = "GPTQ+AGA"
             else:
                 method = "ITF+AGA"
         else:
-            method = "ITF+AGA" if H_use is not None else "ITF"
+            method = "ITF+AGA"
             snr_gptq = None
 
-        # Replace the linear layer with quantized version
-        W_hat = best_alpha.unsqueeze(1) * best_T.float() + best_mu.unsqueeze(1)
-        # Trim back to original size
-        W_hat = W_hat[:out_f, :in_f]
+        if use_hadamard:
+            method += "+Had"
 
+        # Replace the linear layer IN-PLACE
+        W_hat = best_alpha.unsqueeze(1) * best_T.float() + best_mu.unsqueeze(1)
+        if R is not None:
+            # Un-rotate: W_hat_orig = W_hat_rot @ R (since W_rot = W @ R^T)
+            W_hat = W_hat @ R
+        W_hat = W_hat[:out_f, :in_f]
         module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
 
         stats = {
@@ -380,17 +593,18 @@ def quantize_and_replace(model, hessians, linear_layers, use_gptq=True):
             "shape": [out_f, in_f],
             "snr_itf": snr_itf,
             "snr_aga": snr_aga,
-            "snr_gptq": snr_gptq,
+            "snr_gptq": snr_gptq if use_gptq else None,
             "snr_final": best_snr,
             "method": method,
         }
         stats_all.append(stats)
 
-        log.info(f"  {name}: {list(W.shape)} SNR={best_snr:.2f}dB ({method})"
+        log.info(f"  [{layer_idx+1}/{len(linear_layers)}] {name}: {[out_f, in_f]} "
+                 f"SNR={best_snr:.2f}dB ({method})"
                  f" [ITF={snr_itf:.1f}, AGA={snr_aga:.1f}"
                  f"{f', GPTQ={snr_gptq:.1f}' if snr_gptq is not None else ''}]")
 
-        del W, T, best_T, H
+        del W, T, best_T, H, H_use
         gc.collect()
 
     return stats_all
@@ -401,6 +615,19 @@ def compute_snr(W, T, alpha, mu):
     mse = ((W - W_hat) ** 2).mean().item()
     signal = (W ** 2).mean().item()
     return 10 * math.log10(signal / max(mse, 1e-15))
+
+
+def compute_weighted_error(W, T, alpha, mu, H):
+    """
+    Compute activation-weighted output error: trace((W-W_hat) @ H @ (W-W_hat)^T).
+    This is what GPTQ actually optimizes, not per-weight MSE.
+    """
+    W_hat = alpha.unsqueeze(1) * T.float() + mu.unsqueeze(1)
+    E = W - W_hat  # [out_f, in_f]
+    # EH = E @ H  -> [out_f, in_f]
+    # trace(EH @ E^T) = sum of element-wise (EH * E)
+    EH = E @ H
+    return (EH * E).sum().item()
 
 
 # ============================================================================
@@ -415,6 +642,12 @@ def main():
     parser.add_argument("--n-calib", type=int, default=128, help="Calibration samples")
     parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
     parser.add_argument("--eval-samples", type=int, default=40, help="PPL eval samples")
+    parser.add_argument("--hessian-samples", type=int, default=32,
+                        help="Calibration samples per layer for Hessian (default: 32)")
+    parser.add_argument("--skip-first-last", action="store_true",
+                        help="Skip first and last transformer layers")
+    parser.add_argument("--hadamard", action="store_true",
+                        help="Use Hadamard rotation (QuIP#-style, for quality testing)")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Load model in 4-bit (for large models)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -459,21 +692,15 @@ def main():
     t_ppl = time.time() - t0
     log.info(f"Baseline PPL: {baseline_ppl:.2f} ({t_ppl:.0f}s)")
 
-    # ---- Calibration ----
-    log.info("Capturing calibration Hessians...")
+    # ---- Sequential Quantization (calibration + quantize interleaved) ----
+    log.info("Sequential layer-by-layer quantization...")
     t0 = time.time()
-    hessians, linear_layers = capture_hessians(
-        model, tokenizer, device,
-        n_samples=args.n_calib, seq_len=args.seq_len,
-    )
-    t_calib = time.time() - t0
-    log.info(f"Calibration done ({t_calib:.0f}s)")
-
-    # ---- Quantize ----
-    log.info("Quantizing all linear layers...")
-    t0 = time.time()
-    stats = quantize_and_replace(model, hessians, linear_layers,
-                                  use_gptq=not args.no_gptq)
+    stats = quantize_sequential(model, tokenizer, device,
+                                 use_gptq=not args.no_gptq,
+                                 n_calib=args.n_calib, seq_len=args.seq_len,
+                                 n_hessian_samples=args.hessian_samples,
+                                 skip_first_last=args.skip_first_last,
+                                 use_hadamard=args.hadamard)
     t_quant = time.time() - t0
     log.info(f"Quantization done ({t_quant:.0f}s)")
 
@@ -497,7 +724,7 @@ def main():
     log.info(f"  Quantized PPL: {quant_ppl:.2f}")
     log.info(f"  PPL ratio:     {ppl_ratio:.2f}x")
     log.info(f"  SNR: min={min(snrs):.1f}, mean={sum(snrs)/len(snrs):.1f}, max={max(snrs):.1f} dB")
-    log.info(f"  Time: calib={t_calib:.0f}s, quant={t_quant:.0f}s")
+    log.info(f"  Time: quant={t_quant:.0f}s (sequential, includes per-layer calibration)")
     log.info(f"  Layers quantized: {len(stats)}")
 
     # ---- Save results ----
@@ -511,6 +738,7 @@ def main():
         "snr_max": max(snrs),
         "n_layers": len(stats),
         "use_gptq": not args.no_gptq,
+        "sequential": True,
         "n_calib": args.n_calib,
         "seq_len": args.seq_len,
         "layer_stats": stats,

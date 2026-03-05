@@ -2,73 +2,89 @@
 
 ## Summary
 
-Per-layer ternary quantization with ITF+AGA achieves ~7 dB SNR consistently,
-but this compounds to catastrophic quality loss across layers without proper
-GPTQ error compensation.
+Sequential layer-by-layer GPTQ with activation-weighted error selection,
+Hadamard rotation, and SSR column reordering achieves 41x PPL ratio on
+Pythia-1B. GPTQ provides 3.7x improvement over ITF-only, confirming that
+cross-column error propagation is essential for ternary PTQ.
 
 ## Results Table
 
-| Model | Params | Hidden | Layers | Baseline PPL | Quant PPL | PPL Ratio | Method |
-|-------|--------|--------|--------|-------------|-----------|-----------|--------|
-| Pythia-160M | 160M | 768 | 12 | 28.83 | 393M | 13.6M x | ITF+AGA |
-| Pythia-1B | 1.04B | 2048 | 16 | 14.16 | 14,598 | 1031x | ITF+AGA |
+### Pythia-160M (768 hidden, 12 layers)
 
-## Per-Layer SNR Analysis
+| Method | Quant PPL | Ratio | Notes |
+|--------|-----------|-------|-------|
+| Baseline (FP16) | 26.98 | 1.0x | |
+| ITF-only (parallel, all layers) | 418M | 15.5Mx | LM head quantization destroys output |
+| ITF-only (seq, skip embed/head) | 18,803 | 697x | Skipping LM head is critical |
+| GPTQ (seq, skip first/last) | 5,828 | 216x | First/last layers most sensitive |
+| GPTQ + Hadamard (skip first/last) | 3,530 | 131x | Hadamard rotation helps 39% |
 
-Consistent ~7 dB SNR across all layers and model sizes:
-- ITF: 7.1-7.3 dB (best achievable for ternary without error compensation)
-- AGA: No improvement over ITF (weights are already near-zero mean)
-- GPTQ: DEGRADED to 3-6 dB (implementation needs fixing)
+### Pythia-1B (2048 hidden, 16 layers)
 
-## Key Findings
+| Method | Quant PPL | Ratio | Notes |
+|--------|-----------|-------|-------|
+| Baseline (FP16) | 13.21 | 1.0x | |
+| ITF-only (seq, skip first/last) | 2,986 | 226x | Per-weight SNR ~7.1 dB |
+| GPTQ (seq, skip first/last) | 810 | 61x | **3.7x improvement over ITF** |
+| GPTQ + SSR | 581 | 44x | Column reordering helps 28% |
+| **GPTQ + Hadamard** | **546** | **41x** | Best result, all layers GPTQ wins |
 
-### 1. ITF = Optimal MSE
-ITF with per-row (alpha, mu) gives essentially the same SNR as simple optimal
-MSE scaling. The per-row offset (mu) adds only ~0.02 dB because Pythia weights
-are already near-zero-mean.
+## Key Findings (Updated)
 
-### 2. AGA Does Not Help
-AGA refines alpha/mu using calibration covariance, but since ITF already finds
-the global optimum, AGA can only improve if the activation-weighted error differs
-from the unweighted error. In practice, the improvement is negligible.
+### 1. GPTQ Is Working Correctly
+Fixed GPTQ implementation with:
+- **Per-row (alpha, mu) from ITF** for column quantization (not per-column scaling)
+- **Activation-weighted error** (`trace((W-W_hat)@H@(W-W_hat)^T)`) for method selection
+- **ITF re-run after each block** to adapt (alpha, mu) to error-compensated weights
+- GPTQ reduces per-weight SNR (~6.2 dB) but improves activation-weighted error by ~46%
+- End-to-end PPL confirms: GPTQ 3.7x better than ITF-only
 
-### 3. GPTQ Implementation Is Critical
-Our GPTQ implementation makes quality WORSE because:
-- Per-column ternary quantization within GPTQ loses the per-row structure
-- The Hessian-based error propagation is fighting against ITF's optimal assignment
-- Proper GPTQ for ternary needs to maintain per-row (alpha, mu) during column processing
+### 2. Sequential Hessian Capture Is Essential
+Capturing Hessians through the partially-quantized model (sequential pipeline)
+naturally adapts to accumulated quantization error. Each layer's Hessian reflects
+the actual noisy activations from prior quantized layers.
 
-### 4. QEP Overcorrects
-QEP weight correction with alpha=0.5 causes error to explode (error ratio > 200x
-by layer 2). The correction term is too large relative to the original weights
-when the accumulated error is already significant.
+### 3. LM Head Must Not Be Quantized
+Quantizing the LM head (embed_out) causes catastrophic PPL degradation (400M+ PPL).
+The final projection to logits is the most sensitive layer.
 
-### 5. Error Compounding Is Exponential
-- Layer 0: error ratio = 0 (perfect)
-- Layer 1: error ratio = 0.45 (45% of signal is noise)
-- Layer 2: error ratio = 302 (errors have completely dominated)
-- This confirms the QEP paper's finding that cross-layer error compensation
-  is essential, not optional.
+### 4. Hadamard Rotation Helps Significantly
+QuIP#-style Hadamard rotation spreads outlier columns across all dimensions,
+making the weight distribution more uniform before quantization. This gives
+~30-40% improvement in PPL ratio.
 
-## What's Needed
+### 5. SSR Column Reordering Provides Moderate Improvement
+PT2-LLM's Structural Similarity Reordering groups similar columns before
+GPTQ block processing. Worth ~28% improvement on Pythia-1B.
 
-1. **Fix GPTQ for ternary**: Need GPTQ that quantizes columns while maintaining
-   per-row scale/offset consistency. The PT2-LLM paper's approach quantizes
-   blocks of columns and re-runs ITF after each block.
+### 6. Model Scale Matters Enormously
+- Pythia-160M: 131x PPL ratio (best config)
+- Pythia-1B: 41x PPL ratio (best config)
+- Trend suggests 7B+ models would have much better ratios
 
-2. **Proper QEP integration**: QEP needs careful alpha tuning and possibly
-   layer-wise adaptation. alpha=0.5 is too aggressive when errors compound fast.
+## PT2-LLM Paper Reference (ICLR 2026)
 
-3. **Better baseline**: Test with a model that has published PT2-LLM results
-   (e.g., LLaMA-7B) to validate against paper claims before debugging.
+| Model | PT2-LLM PPL | Baseline | Ratio |
+|-------|-------------|----------|-------|
+| LLaMA-7B | 11.39 | 5.68 | 2.0x |
+| LLaMA-13B | 9.11 | ~5.25 | 1.7x |
+| LLaMA-65B | 6.62 | ~5.2 | 1.3x |
+| LLaMA-3-8B | 32.19 | ~6.23 | 5.2x |
 
-## Reference: PT2-LLM Paper Claims
+Note: No published code yet (repo is placeholder). Our implementation is
+based on the paper description of ITF + AGA + GPTQ + SSR.
 
-| Model | Method | PPL (Wiki2) |
-|-------|--------|-------------|
-| LLaMA-7B | FP16 baseline | 5.68 |
-| LLaMA-7B | PT2-LLM ternary | ~6.5-7.0 (estimated) |
-| LLaMA-7B | GPTQ 2-bit | ~7.0 |
+## Remaining Gap Analysis
 
-The paper shows competitive results with 2-bit GPTQ, suggesting the GPTQ
-integration is the key differentiator, not ITF/AGA alone.
+Our best (41x on Pythia-1B) vs PT2-LLM (2x on LLaMA-7B):
+1. **Scale**: 1B vs 7B (larger models are more redundant)
+2. **Architecture**: LLaMA vs Pythia (LLaMA may be more quantization-friendly)
+3. **LLaMA-3-8B gets 5.2x** ratio, much worse than LLaMA-7B's 2x
+4. Our GPTQ may still have room for improvement
+
+## Next Steps
+
+1. Test on LLaMA-7B to compare directly against paper claims
+2. Test on Pythia-2.8B to validate scaling trend
+3. Consider PTQTP (dual trit-plane, ~3 bits) for better quality
+4. Investigate weight distribution transformation (DBellQuant approach)
