@@ -92,6 +92,156 @@ def apply_hadamard_rotation(W, H_hessian, seed=42):
 
 
 # ============================================================================
+# PTQTP: Dual Trit-Plane Decomposition
+# ============================================================================
+
+def ptqtp_dual_trit(W: torch.Tensor, group_size: int = 128, max_iters: int = 50,
+                    eps: float = 1e-4, H: torch.Tensor = None):
+    """
+    PTQTP-style dual trit-plane decomposition (improved).
+
+    W ≈ diag(alpha1) * T1 + diag(alpha2) * T2
+
+    Key improvements over initial version:
+    - Adaptive regularization (condition-number guided, as in PTQTP paper)
+    - Activation-aware element search when Hessian H is provided
+    - max_iters=50 (paper default) with ε=1e-4 tolerance
+
+    Returns: T1, T2 (int8), alpha1, alpha2 (per-group scales), group_size
+    """
+    out_f, in_f = W.shape
+
+    # Pad to multiple of group_size
+    pad = (group_size - in_f % group_size) % group_size
+    if pad > 0:
+        W_padded = torch.nn.functional.pad(W, (0, pad))
+    else:
+        W_padded = W
+
+    n_groups = W_padded.shape[1] // group_size
+    padded_in = W_padded.shape[1]
+
+    # Reshape to (out_f, n_groups, group_size)
+    W_g = W_padded.reshape(out_f, n_groups, group_size)
+
+    # Compute per-element Hessian weights for activation-aware search
+    h_weights = None
+    if H is not None:
+        h_diag = H.diagonal()
+        # Pad Hessian diagonal to match
+        if h_diag.shape[0] < padded_in:
+            h_diag = torch.nn.functional.pad(h_diag, (0, padded_in - h_diag.shape[0]), value=1.0)
+        elif h_diag.shape[0] > padded_in:
+            h_diag = h_diag[:padded_in]
+        # Reshape to (1, n_groups, group_size) for broadcasting
+        h_weights = h_diag.reshape(1, n_groups, group_size).clamp(min=1e-10)
+        # Normalize per-group so weights sum to group_size (relative importance)
+        h_weights = h_weights / (h_weights.mean(dim=2, keepdim=True) + 1e-10)
+
+    # Initialize T1 from sign, T2 from sign of residual
+    T1 = torch.sign(W_g).to(torch.int8)
+    T1[T1 == 0] = 1
+
+    # Initialize scales with per-row magnitude
+    row_mag = W_g.abs().mean(dim=2)  # (out_f, n_groups)
+    alpha1 = row_mag.clone()
+    alpha2 = (row_mag * 0.3).clone()  # T2 typically has smaller scale
+
+    # Initial residual for T2
+    residual = W_g - alpha1.unsqueeze(2) * T1.float()
+    T2 = torch.sign(residual).to(torch.int8)
+    T2[T2 == 0] = 1
+
+    # Adaptive regularization per (row, group)
+    lam = torch.full((out_f, n_groups), 0.01)
+    lam_max = 1.0
+    kappa_thresh = 1e6
+
+    for iteration in range(max_iters):
+        alpha1_old = alpha1.clone()
+
+        # Step 1: Ridge regression for alpha1, alpha2 (per-group, per-row)
+        T1_f = T1.float()
+        T2_f = T2.float()
+
+        # 2x2 system per (row, group)
+        if h_weights is not None:
+            # Weighted regression: use Hessian diagonal as weights
+            a11 = (h_weights * T1_f * T1_f).sum(dim=2)
+            a12 = (h_weights * T1_f * T2_f).sum(dim=2)
+            a22 = (h_weights * T2_f * T2_f).sum(dim=2)
+            b1 = (h_weights * T1_f * W_g).sum(dim=2)
+            b2 = (h_weights * T2_f * W_g).sum(dim=2)
+        else:
+            a11 = (T1_f * T1_f).sum(dim=2)
+            a12 = (T1_f * T2_f).sum(dim=2)
+            a22 = (T2_f * T2_f).sum(dim=2)
+            b1 = (T1_f * W_g).sum(dim=2)
+            b2 = (T2_f * W_g).sum(dim=2)
+
+        # Adaptive regularization (condition-number guided)
+        det_unreg = a11 * a22 - a12 * a12
+        trace = a11 + a22
+        # Approximate condition number: trace^2 / (4 * det)
+        kappa_approx = (trace * trace) / (4 * det_unreg.abs().clamp(min=1e-15))
+        # Increase lambda where condition number is high
+        lam = torch.where(kappa_approx > kappa_thresh, (lam * 2).clamp(max=lam_max), lam)
+        lam = torch.where(kappa_approx < kappa_thresh * 0.1, (lam * 0.5).clamp(min=1e-8), lam)
+
+        det = (a11 + lam) * (a22 + lam) - a12 * a12
+        det = det.clamp(min=1e-10)
+
+        alpha1 = ((a22 + lam) * b1 - a12 * b2) / det
+        alpha2 = ((a11 + lam) * b2 - a12 * b1) / det
+
+        alpha1 = alpha1.clamp(min=0)
+        alpha2 = alpha2.clamp(min=0)
+
+        # Step 2: Exhaustive search for T1, T2 per element
+        a1 = alpha1.unsqueeze(2)
+        a2 = alpha2.unsqueeze(2)
+
+        best_err = torch.full_like(W_g, float('inf'))
+        best_t1 = T1.clone()
+        best_t2 = T2.clone()
+
+        for t1_val in [-1, 0, 1]:
+            for t2_val in [-1, 0, 1]:
+                w_hat = a1 * t1_val + a2 * t2_val
+                err = (W_g - w_hat) ** 2
+                # Activation-aware: weight errors by Hessian diagonal
+                if h_weights is not None:
+                    err = err * h_weights
+                better = err < best_err
+                best_err = torch.where(better, err, best_err)
+                best_t1 = torch.where(better, torch.tensor(t1_val, dtype=torch.int8), best_t1)
+                best_t2 = torch.where(better, torch.tensor(t2_val, dtype=torch.int8), best_t2)
+
+        T1 = best_t1
+        T2 = best_t2
+
+        # Check convergence
+        alpha_diff = (alpha1 - alpha1_old).abs().max().item()
+        if alpha_diff < eps:
+            break
+
+    # Reshape back to (out_f, in_f)
+    T1_out = T1.reshape(out_f, -1)[:, :in_f]
+    T2_out = T2.reshape(out_f, -1)[:, :in_f]
+
+    return T1_out, T2_out, alpha1, alpha2, group_size
+
+
+def dequantize_ptqtp(T1, T2, alpha1, alpha2, group_size, out_f, in_f):
+    """Dequantize PTQTP dual trit-plane to full precision."""
+    # Expand alpha from (out_f, n_groups) to (out_f, in_f)
+    n_groups = alpha1.shape[1]
+    a1 = alpha1.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+    a2 = alpha2.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+    return a1 * T1.float() + a2 * T2.float()
+
+
+# ============================================================================
 # PT2-LLM Core: ITF + AGA
 # ============================================================================
 
@@ -328,31 +478,39 @@ def gptq_ternary(W, H, block_size=128, use_ssr=True):
 
 def greedy_bitflip(W, T, alpha, mu, H, n_iters=3):
     """
-    Greedy bit-flip optimization: find elements where flipping the ternary
-    value reduces activation-weighted error. Fully vectorized.
+    Greedy bit-flip optimization using FULL Hessian (not diagonal approximation).
 
-    For each element (i,j), tries all 3 ternary values and picks the best.
-    Uses diagonal approximation of H for speed (full H would be O(n^2) per flip).
+    For each element (i,j), the change in activation-weighted error when flipping
+    T[i,j] from t_old to t_new (with fixed alpha, mu) is:
+        delta = 2 * d * (EH)[i,j] + d^2 * H[j,j]
+    where d = alpha[i] * (t_old - t_new) and EH = E @ H.
+
+    This preserves GPTQ's cross-column optimization because it uses the full H.
     """
     T_f = T.float().clone()
     out_f, in_f = W.shape
-    h_diag = H.diagonal().unsqueeze(0)  # [1, in_f]
+    h_diag = H.diagonal()  # [in_f]
 
     for iteration in range(n_iters):
         W_hat = alpha.unsqueeze(1) * T_f + mu.unsqueeze(1)
         E = W - W_hat  # [out_f, in_f]
-        cur_err_sq = E ** 2 * h_diag  # [out_f, in_f]
+        EH = E @ H  # [out_f, in_f] - full Hessian product
 
         best_val = T_f.clone()
-        best_err = cur_err_sq.clone()
+        best_delta = torch.zeros_like(T_f)
 
         for new_val in [-1.0, 0.0, 1.0]:
-            new_w_hat = alpha.unsqueeze(1) * new_val + mu.unsqueeze(1)
-            new_err = W - new_w_hat
-            new_err_sq = new_err ** 2 * h_diag
-            better = new_err_sq < best_err
+            # d[i,j] = alpha[i] * (T_f[i,j] - new_val)
+            d = alpha.unsqueeze(1) * (T_f - new_val)
+            # delta[i,j] = 2 * d * EH[i,j] + d^2 * H[j,j]
+            delta = 2 * d * EH + d * d * h_diag.unsqueeze(0)
+            # Negative delta means improvement
+            better = delta < best_delta
+            # Skip elements that are already at this value
+            same = (T_f == new_val)
+            better = better & ~same
             best_val = torch.where(better, torch.tensor(new_val), best_val)
-            best_err = torch.where(better, new_err_sq, best_err)
+            best_delta = torch.where(better, delta, best_delta)
 
         changed = (best_val != T_f)
         n_flips = changed.sum().item()
@@ -487,7 +645,9 @@ def _is_first_or_last_layer(name, model):
 
 def quantize_sequential(model, tokenizer, device, use_gptq=True,
                         n_calib=128, seq_len=2048, n_hessian_samples=32,
-                        skip_first_last=False, use_hadamard=False):
+                        skip_first_last=False, use_hadamard=False,
+                        use_bitflip=False, bitflip_iters=3,
+                        use_ptqtp=False, ptqtp_group_size=128):
     """
     Quantize layers SEQUENTIALLY: after quantizing layer i, the Hessian
     for layer i+1 is captured through the already-quantized layers.
@@ -539,61 +699,106 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
         else:
             H_use = H
 
-        # Optional: Hadamard rotation for incoherence processing
-        R = None
-        W_q = W  # weight to quantize (possibly rotated)
-        H_q = H_use  # Hessian for quantization (possibly rotated)
-        if use_hadamard:
-            W_q, H_q, R = apply_hadamard_rotation(W, H_use, seed=42 + layer_idx)
+        if use_ptqtp:
+            # PTQTP: Dual trit-plane decomposition
+            # Optionally apply Hadamard rotation first
+            R = None
+            W_q = W
+            H_q = H_use
+            if use_hadamard:
+                W_q, H_q, R = apply_hadamard_rotation(W, H_use, seed=42 + layer_idx)
 
-        # Step 1: ITF
-        T, alpha, mu = iterative_ternary_fitting(W_q, n_iters=10)
-        snr_itf = compute_snr(W_q, T, alpha, mu)
+            # PTQTP with activation-aware optimization (pass Hessian)
+            T1, T2, a1, a2, gs = ptqtp_dual_trit(
+                W_q, group_size=ptqtp_group_size, H=H_q
+            )
+            W_hat = dequantize_ptqtp(T1, T2, a1, a2, gs, out_f, in_f)
+            W_hat = W_hat[:out_f, :in_f]
 
-        # Step 2: AGA
-        alpha, mu = activation_aware_alignment(W_q, T, H_q, itf_alpha=alpha, itf_mu=mu)
-        snr_aga = compute_snr(W_q, T, alpha, mu)
-
-        # Step 3: GPTQ
-        best_T, best_alpha, best_mu = T, alpha, mu
-        best_snr = snr_aga
-
-        if use_gptq:
-            T_g, alpha_g, mu_g = gptq_ternary(W_q, H_q)
-            alpha_g, mu_g = activation_aware_alignment(W_q, T_g, H_q,
-                                                       itf_alpha=alpha_g, itf_mu=mu_g)
-            snr_gptq = compute_snr(W_q, T_g, alpha_g, mu_g)
-
-            err_itf = compute_weighted_error(W_q, T, alpha, mu, H_q)
-            err_gptq = compute_weighted_error(W_q, T_g, alpha_g, mu_g, H_q)
-
-            if err_gptq < err_itf:
-                best_T, best_alpha, best_mu = T_g, alpha_g, mu_g
-                best_snr = snr_gptq
-                method = "GPTQ+AGA"
+            # Undo Hadamard rotation if applied
+            if R is not None:
+                W_hat = W_hat @ R  # W_hat was in rotated space, undo
+                method = "PTQTP+Had"
             else:
-                method = "ITF+AGA"
-        else:
-            method = "ITF+AGA"
+                method = "PTQTP"
+
+            mse = ((W[:out_f, :in_f] - W_hat) ** 2).mean().item()
+            signal = (W[:out_f, :in_f] ** 2).mean().item()
+            best_snr = 10 * math.log10(signal / max(mse, 1e-15))
+            snr_itf = best_snr
+            snr_aga = best_snr
             snr_gptq = None
 
-        if use_hadamard:
-            method += "+Had"
+            module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
+        else:
+            # PT2-LLM pipeline: ITF + AGA + GPTQ
+            # Optional: Hadamard rotation for incoherence processing
+            R = None
+            W_q = W  # weight to quantize (possibly rotated)
+            H_q = H_use  # Hessian for quantization (possibly rotated)
+            if use_hadamard:
+                W_q, H_q, R = apply_hadamard_rotation(W, H_use, seed=42 + layer_idx)
 
-        # Replace the linear layer IN-PLACE
-        W_hat = best_alpha.unsqueeze(1) * best_T.float() + best_mu.unsqueeze(1)
-        if R is not None:
-            # Un-rotate: W_hat_orig = W_hat_rot @ R (since W_rot = W @ R^T)
-            W_hat = W_hat @ R
-        W_hat = W_hat[:out_f, :in_f]
-        module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
+            # Step 1: ITF
+            T, alpha, mu = iterative_ternary_fitting(W_q, n_iters=10)
+            snr_itf = compute_snr(W_q, T, alpha, mu)
+
+            # Step 2: AGA
+            alpha, mu = activation_aware_alignment(W_q, T, H_q, itf_alpha=alpha, itf_mu=mu)
+            snr_aga = compute_snr(W_q, T, alpha, mu)
+
+            # Step 3: GPTQ
+            best_T, best_alpha, best_mu = T, alpha, mu
+            best_snr = snr_aga
+
+            if use_gptq:
+                T_g, alpha_g, mu_g = gptq_ternary(W_q, H_q)
+                alpha_g, mu_g = activation_aware_alignment(W_q, T_g, H_q,
+                                                           itf_alpha=alpha_g, itf_mu=mu_g)
+                snr_gptq = compute_snr(W_q, T_g, alpha_g, mu_g)
+
+                err_itf = compute_weighted_error(W_q, T, alpha, mu, H_q)
+                err_gptq = compute_weighted_error(W_q, T_g, alpha_g, mu_g, H_q)
+
+                if err_gptq < err_itf:
+                    best_T, best_alpha, best_mu = T_g, alpha_g, mu_g
+                    best_snr = snr_gptq
+                    method = "GPTQ+AGA"
+                else:
+                    method = "ITF+AGA"
+            else:
+                method = "ITF+AGA"
+                snr_gptq = None
+
+            # Step 4: Greedy bitflip refinement (full Hessian)
+            if use_bitflip:
+                err_before = compute_weighted_error(W_q, best_T, best_alpha, best_mu, H_q)
+                T_bf, alpha_bf, mu_bf = greedy_bitflip(
+                    W_q, best_T, best_alpha, best_mu, H_q, n_iters=bitflip_iters
+                )
+                err_after = compute_weighted_error(W_q, T_bf, alpha_bf, mu_bf, H_q)
+                if err_after < err_before:
+                    best_T, best_alpha, best_mu = T_bf, alpha_bf, mu_bf
+                    best_snr = compute_snr(W_q, best_T, best_alpha, best_mu)
+                    method += "+BF"
+
+            if use_hadamard:
+                method += "+Had"
+
+            # Replace the linear layer IN-PLACE
+            W_hat = best_alpha.unsqueeze(1) * best_T.float() + best_mu.unsqueeze(1)
+            if R is not None:
+                # Un-rotate: W_hat_orig = W_hat_rot @ R (since W_rot = W @ R^T)
+                W_hat = W_hat @ R
+            W_hat = W_hat[:out_f, :in_f]
+            module.weight.data = W_hat.to(module.weight.dtype).to(module.weight.device)
 
         stats = {
             "name": name,
             "shape": [out_f, in_f],
             "snr_itf": snr_itf,
             "snr_aga": snr_aga,
-            "snr_gptq": snr_gptq if use_gptq else None,
+            "snr_gptq": snr_gptq if (not use_ptqtp and use_gptq) else None,
             "snr_final": best_snr,
             "method": method,
         }
@@ -604,7 +809,7 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
                  f" [ITF={snr_itf:.1f}, AGA={snr_aga:.1f}"
                  f"{f', GPTQ={snr_gptq:.1f}' if snr_gptq is not None else ''}]")
 
-        del W, T, best_T, H, H_use
+        del W, H, H_use
         gc.collect()
 
     return stats_all
@@ -648,6 +853,14 @@ def main():
                         help="Skip first and last transformer layers")
     parser.add_argument("--hadamard", action="store_true",
                         help="Use Hadamard rotation (QuIP#-style, for quality testing)")
+    parser.add_argument("--bitflip", action="store_true",
+                        help="Enable greedy bitflip post-GPTQ refinement (full Hessian)")
+    parser.add_argument("--bitflip-iters", type=int, default=3,
+                        help="Number of bitflip iterations (default: 3)")
+    parser.add_argument("--ptqtp", action="store_true",
+                        help="Use PTQTP dual trit-plane decomposition (~3.16 bits)")
+    parser.add_argument("--ptqtp-group-size", type=int, default=128,
+                        help="PTQTP group size for scales (default: 128)")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Load model in 4-bit (for large models)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -700,7 +913,11 @@ def main():
                                  n_calib=args.n_calib, seq_len=args.seq_len,
                                  n_hessian_samples=args.hessian_samples,
                                  skip_first_last=args.skip_first_last,
-                                 use_hadamard=args.hadamard)
+                                 use_hadamard=args.hadamard,
+                                 use_bitflip=args.bitflip,
+                                 bitflip_iters=args.bitflip_iters,
+                                 use_ptqtp=args.ptqtp,
+                                 ptqtp_group_size=args.ptqtp_group_size)
     t_quant = time.time() - t0
     log.info(f"Quantization done ({t_quant:.0f}s)")
 
