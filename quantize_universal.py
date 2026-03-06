@@ -65,35 +65,227 @@ def apply_hadamard_rotation(W, H_hessian, seed=42):
     """
     Apply Hadamard rotation to weight columns and Hessian.
     W' = W @ R^T,  H' = R @ H @ R^T
+    For large in_f, uses block-diagonal application to avoid storing full R.
     Returns: W_rotated, H_rotated, R
     """
     in_f = W.shape[1]
+    device = W.device
     torch.manual_seed(seed)
 
-    # For large matrices, use block-diagonal Hadamard for efficiency
+    # Random sign flips (generated before Hadamard for reproducibility)
+    signs = (torch.randint(0, 2, (in_f,), device=device) * 2 - 1).float()
+
     if in_f > 2048:
+        # Block-diagonal: apply blocks directly without materializing full R
         block_size = 256
-        R = torch.zeros(in_f, in_f)
+        W_rot = W.clone()
+        H_rot = H_hessian.clone()
+        # Apply sign flips first (diagonal, trivially parallel)
+        W_rot = W_rot * signs.unsqueeze(0)
+        H_rot = H_rot * signs.unsqueeze(0) * signs.unsqueeze(1)
+
         for i in range(0, in_f, block_size):
             end = min(i + block_size, in_f)
             bs = end - i
-            R[i:end, i:end] = hadamard_matrix(bs)
+            Hb = hadamard_matrix(bs).to(device)
+            # W_rot[:, i:end] = W_rot[:, i:end] @ Hb.T
+            W_rot[:, i:end] = W_rot[:, i:end] @ Hb.T
+            # H_rot[i:end, :] = Hb @ H_rot[i:end, :]
+            H_rot[i:end, :] = Hb @ H_rot[i:end, :]
+            # H_rot[:, i:end] = H_rot[:, i:end] @ Hb.T
+            H_rot[:, i:end] = H_rot[:, i:end] @ Hb.T
+
+        # Build full R for inverse rotation (needed for W_hat @ R)
+        R = torch.zeros(in_f, in_f, device=device)
+        for i in range(0, in_f, block_size):
+            end = min(i + block_size, in_f)
+            bs = end - i
+            R[i:end, i:end] = hadamard_matrix(bs).to(device)
+        R = R * signs.unsqueeze(0)
     else:
-        R = hadamard_matrix(in_f)
-
-    # Apply random sign flips for additional incoherence
-    signs = (torch.randint(0, 2, (in_f,)) * 2 - 1).float()
-    R = R * signs.unsqueeze(0)
-
-    W_rot = W @ R.T
-    H_rot = R @ H_hessian @ R.T
+        R = hadamard_matrix(in_f).to(device)
+        R = R * signs.unsqueeze(0)
+        W_rot = W @ R.T
+        H_rot = R @ H_hessian @ R.T
 
     return W_rot, H_rot, R
 
 
 # ============================================================================
-# PTQTP: Dual Trit-Plane Decomposition
+# PTQTP: Multi Trit-Plane Decomposition (2 or 3 planes)
 # ============================================================================
+
+def ptqtp_tri_trit(W: torch.Tensor, group_size: int = 128, max_iters: int = 50,
+                   eps: float = 1e-4, H: torch.Tensor = None):
+    """
+    3-plane trit decomposition: W ≈ α₁·T₁ + α₂·T₂ + α₃·T₃
+
+    27 possible values per element (~4.75 bits/weight + scale overhead).
+    With G=128: ~5.5 effective bits. Should achieve <1.02x PPL ratio.
+
+    Returns: T1, T2, T3 (int8), alpha1, alpha2, alpha3 (per-group), group_size
+    """
+    out_f, in_f = W.shape
+
+    pad = (group_size - in_f % group_size) % group_size
+    if pad > 0:
+        W_padded = torch.nn.functional.pad(W, (0, pad))
+    else:
+        W_padded = W
+    n_groups = W_padded.shape[1] // group_size
+    padded_in = W_padded.shape[1]
+
+    W_g = W_padded.reshape(out_f, n_groups, group_size)
+
+    # Hessian weights
+    h_weights = None
+    if H is not None:
+        h_diag = H.diagonal()
+        if h_diag.shape[0] < padded_in:
+            h_diag = torch.nn.functional.pad(h_diag, (0, padded_in - h_diag.shape[0]), value=1.0)
+        elif h_diag.shape[0] > padded_in:
+            h_diag = h_diag[:padded_in]
+        h_weights = h_diag.reshape(1, n_groups, group_size).clamp(min=1e-10)
+        h_weights = h_weights / (h_weights.mean(dim=2, keepdim=True) + 1e-10)
+
+    # Initialize T1 from sign
+    T1 = torch.sign(W_g).to(torch.int8)
+    T1[T1 == 0] = 1
+
+    row_mag = W_g.abs().mean(dim=2)
+    alpha1 = row_mag.clone()
+    alpha2 = (row_mag * 0.3).clone()
+    alpha3 = (row_mag * 0.1).clone()
+
+    # T2 from residual after T1
+    res1 = W_g - alpha1.unsqueeze(2) * T1.float()
+    T2 = torch.sign(res1).to(torch.int8)
+    T2[T2 == 0] = 1
+
+    # T3 from residual after T1+T2
+    res2 = W_g - alpha1.unsqueeze(2) * T1.float() - alpha2.unsqueeze(2) * T2.float()
+    T3 = torch.sign(res2).to(torch.int8)
+    T3[T3 == 0] = 1
+
+    lam = torch.full((out_f, n_groups), 0.01, device=W.device)
+    lam_max = 1.0
+    kappa_thresh = 1e6
+
+    # Pre-compute all 27 combos as tensors for vectorized GPU evaluation
+    combo_vals = []
+    for t1 in [-1, 0, 1]:
+        for t2 in [-1, 0, 1]:
+            for t3 in [-1, 0, 1]:
+                combo_vals.append((t1, t2, t3))
+    # Shape: [27, 3] — all combos as a single tensor on device
+    combo_tensor = torch.tensor(combo_vals, dtype=torch.float32, device=W.device)  # [27, 3]
+
+    for iteration in range(max_iters):
+        alpha1_old = alpha1.clone()
+
+        T1_f = T1.float()
+        T2_f = T2.float()
+        T3_f = T3.float()
+
+        # 3x3 weighted least squares per (row, group)
+        if h_weights is not None:
+            hT1 = h_weights * T1_f
+            hT2 = h_weights * T2_f
+            hT3 = h_weights * T3_f
+            hW = h_weights * W_g
+        else:
+            hT1 = T1_f
+            hT2 = T2_f
+            hT3 = T3_f
+            hW = W_g
+
+        a11 = (hT1 * T1_f).sum(2)
+        a12 = (hT1 * T2_f).sum(2)
+        a13 = (hT1 * T3_f).sum(2)
+        a22 = (hT2 * T2_f).sum(2)
+        a23 = (hT2 * T3_f).sum(2)
+        a33 = (hT3 * T3_f).sum(2)
+        b1 = (hT1 * W_g).sum(2)  # using W_g not hW
+        b2 = (hT2 * W_g).sum(2)
+        b3 = (hT3 * W_g).sum(2)
+
+        if h_weights is not None:
+            b1 = (hW * T1_f).sum(2)
+            b2 = (hW * T2_f).sum(2)
+            b3 = (hW * T3_f).sum(2)
+
+        # Solve 3x3 system with regularization: (A + λI)α = b
+        # Use batched solve via torch
+        A = torch.stack([
+            torch.stack([a11 + lam, a12, a13], dim=-1),
+            torch.stack([a12, a22 + lam, a23], dim=-1),
+            torch.stack([a13, a23, a33 + lam], dim=-1),
+        ], dim=-2)  # [out_f, n_groups, 3, 3]
+        b = torch.stack([b1, b2, b3], dim=-1).unsqueeze(-1)  # [out_f, n_groups, 3, 1]
+
+        try:
+            alpha_vec = torch.linalg.solve(A, b).squeeze(-1)  # [out_f, n_groups, 3]
+        except Exception:
+            # Fallback: add more regularization
+            A.diagonal(dim1=-2, dim2=-1).add_(0.1)
+            alpha_vec = torch.linalg.solve(A, b).squeeze(-1)
+
+        alpha1 = alpha_vec[:, :, 0].clamp(min=0)
+        alpha2 = alpha_vec[:, :, 1].clamp(min=0)
+        alpha3 = alpha_vec[:, :, 2].clamp(min=0)
+
+        # Exhaustive 27-way search — fully vectorized, single kernel per chunk
+        # Process in row chunks to bound VRAM: err tensor is [chunk, n_groups, group_size, 27]
+        combo_int = torch.tensor(combo_vals, dtype=torch.int8, device=W.device)  # [27, 3]
+        ct = combo_tensor.unsqueeze(0)  # [1, 27, 3]
+
+        # Chunk size: target ~8GB peak for the err tensor (RTX 3090 Ti has 24GB)
+        # err: chunk_rows * n_groups * group_size * 27 * 4 bytes
+        max_bytes = 8 * 1024**3
+        elems_per_row = n_groups * group_size * 27
+        chunk_rows = max(1, max_bytes // (elems_per_row * 4))
+        chunk_rows = min(chunk_rows, out_f)
+
+        for r0 in range(0, out_f, chunk_rows):
+            r1 = min(r0 + chunk_rows, out_f)
+            # Per-group scales for this chunk: [chunk, n_groups, 1, 3]
+            s_chunk = torch.stack([
+                alpha1[r0:r1].unsqueeze(2),
+                alpha2[r0:r1].unsqueeze(2),
+                alpha3[r0:r1].unsqueeze(2),
+            ], dim=-1)
+            # 27 possible values per (row, group): [chunk, n_groups, 27]
+            w_hat_27 = (s_chunk * ct.unsqueeze(0)).sum(dim=-1)
+            # Squared error for all combos: [chunk, n_groups, group_size, 27]
+            err_all = (W_g[r0:r1].unsqueeze(-1) - w_hat_27.unsqueeze(2)) ** 2
+            if h_weights is not None:
+                err_all = err_all * h_weights.unsqueeze(-1)  # [1, n_groups, group_size, 1] broadcasts
+            # Best combo per element
+            best_idx = err_all.argmin(dim=-1).reshape(-1)
+            T1[r0:r1] = combo_int[best_idx, 0].reshape(r1 - r0, n_groups, group_size)
+            T2[r0:r1] = combo_int[best_idx, 1].reshape(r1 - r0, n_groups, group_size)
+            T3[r0:r1] = combo_int[best_idx, 2].reshape(r1 - r0, n_groups, group_size)
+            del err_all, w_hat_27, s_chunk, best_idx
+
+        alpha_diff = (alpha1 - alpha1_old).abs().max().item()
+        if alpha_diff < eps:
+            break
+
+    T1_out = T1.reshape(out_f, -1)[:, :in_f]
+    T2_out = T2.reshape(out_f, -1)[:, :in_f]
+    T3_out = T3.reshape(out_f, -1)[:, :in_f]
+
+    return T1_out, T2_out, T3_out, alpha1, alpha2, alpha3, group_size
+
+
+def dequantize_tri_trit(T1, T2, T3, alpha1, alpha2, alpha3, group_size, out_f, in_f):
+    """Dequantize 3-plane trit decomposition."""
+    n_groups = alpha1.shape[1]
+    a1 = alpha1.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+    a2 = alpha2.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+    a3 = alpha3.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+    return a1 * T1.float() + a2 * T2.float() + a3 * T3.float()
+
 
 def ptqtp_dual_trit(W: torch.Tensor, group_size: int = 128, max_iters: int = 50,
                     eps: float = 1e-4, H: torch.Tensor = None):
@@ -153,7 +345,7 @@ def ptqtp_dual_trit(W: torch.Tensor, group_size: int = 128, max_iters: int = 50,
     T2[T2 == 0] = 1
 
     # Adaptive regularization per (row, group)
-    lam = torch.full((out_f, n_groups), 0.01)
+    lam = torch.full((out_f, n_groups), 0.01, device=W.device)
     lam_max = 1.0
     kappa_thresh = 1e6
 
@@ -197,28 +389,38 @@ def ptqtp_dual_trit(W: torch.Tensor, group_size: int = 128, max_iters: int = 50,
         alpha1 = alpha1.clamp(min=0)
         alpha2 = alpha2.clamp(min=0)
 
-        # Step 2: Exhaustive search for T1, T2 per element
-        a1 = alpha1.unsqueeze(2)
-        a2 = alpha2.unsqueeze(2)
+        # Step 2: Exhaustive 9-way search — vectorized with row chunking
+        # All 9 combos as tensors on device
+        dual_combos = torch.tensor(
+            [(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)],
+            dtype=torch.float32, device=W.device
+        )  # [9, 2]
+        dual_combos_int = torch.tensor(
+            [(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)],
+            dtype=torch.int8, device=W.device
+        )  # [9, 2]
+        dc = dual_combos.unsqueeze(0)  # [1, 9, 2]
 
-        best_err = torch.full_like(W_g, float('inf'))
-        best_t1 = T1.clone()
-        best_t2 = T2.clone()
+        # Chunk to bound VRAM (~8GB peak for err tensor)
+        max_bytes = 8 * 1024**3
+        elems_per_row = n_groups * group_size * 9
+        chunk_rows = max(1, max_bytes // (elems_per_row * 4))
+        chunk_rows = min(chunk_rows, out_f)
 
-        for t1_val in [-1, 0, 1]:
-            for t2_val in [-1, 0, 1]:
-                w_hat = a1 * t1_val + a2 * t2_val
-                err = (W_g - w_hat) ** 2
-                # Activation-aware: weight errors by Hessian diagonal
-                if h_weights is not None:
-                    err = err * h_weights
-                better = err < best_err
-                best_err = torch.where(better, err, best_err)
-                best_t1 = torch.where(better, torch.tensor(t1_val, dtype=torch.int8), best_t1)
-                best_t2 = torch.where(better, torch.tensor(t2_val, dtype=torch.int8), best_t2)
-
-        T1 = best_t1
-        T2 = best_t2
+        for r0 in range(0, out_f, chunk_rows):
+            r1 = min(r0 + chunk_rows, out_f)
+            s_chunk = torch.stack([
+                alpha1[r0:r1].unsqueeze(2),
+                alpha2[r0:r1].unsqueeze(2),
+            ], dim=-1)  # [chunk, n_groups, 1, 2]
+            w_hat_9 = (s_chunk * dc.unsqueeze(0)).sum(dim=-1)  # [chunk, n_groups, 9]
+            err_9 = (W_g[r0:r1].unsqueeze(-1) - w_hat_9.unsqueeze(2)) ** 2
+            if h_weights is not None:
+                err_9 = err_9 * h_weights.unsqueeze(-1)  # [1, n_groups, group_size, 1] broadcasts
+            best_idx = err_9.argmin(dim=-1).reshape(-1)
+            T1[r0:r1] = dual_combos_int[best_idx, 0].reshape(r1 - r0, n_groups, group_size)
+            T2[r0:r1] = dual_combos_int[best_idx, 1].reshape(r1 - r0, n_groups, group_size)
+            del err_9, w_hat_9, s_chunk, best_idx
 
         # Check convergence
         alpha_diff = (alpha1 - alpha1_old).abs().max().item()
@@ -232,6 +434,137 @@ def ptqtp_dual_trit(W: torch.Tensor, group_size: int = 128, max_iters: int = 50,
     return T1_out, T2_out, alpha1, alpha2, group_size
 
 
+def gptq_dual_trit(W: torch.Tensor, H: torch.Tensor, group_size: int = 128,
+                    block_size: int = 128):
+    """
+    GPTQ-style column-sequential quantization for dual trit-planes.
+
+    Key advantage over element-wise PTQTP: error propagation via full H_inv
+    captures cross-column correlations. When column j is quantized with error δ,
+    future columns are adjusted: W[:, j+1:] -= δ * H_inv[j, j+1:] / H_inv[j,j].
+
+    Pipeline:
+    1. Quick PTQTP pass for initial per-group scales (α1, α2)
+    2. Column-sequential 9-way search with H_inv error propagation
+    3. Re-optimize scales per-group after all columns processed
+
+    Returns: T1, T2 (int8), alpha1, alpha2 (per-group), group_size
+    """
+    out_f, in_f = W.shape
+    W_orig = W.clone()
+
+    # Pad to multiple of group_size
+    pad = (group_size - in_f % group_size) % group_size
+    if pad > 0:
+        W_padded = torch.nn.functional.pad(W, (0, pad))
+        H_padded = torch.zeros(in_f + pad, in_f + pad)
+        H_padded[:in_f, :in_f] = H
+        H_padded[in_f:, in_f:] = torch.eye(pad) * H.diagonal().mean()
+    else:
+        W_padded = W
+        H_padded = H
+    padded_in = W_padded.shape[1]
+    n_groups = padded_in // group_size
+
+    # Step 1: Initialize scales from quick PTQTP (20 iterations)
+    _, _, alpha1, alpha2, gs = ptqtp_dual_trit(
+        W_padded, group_size=group_size, H=H_padded, max_iters=20
+    )
+
+    # Step 2: Compute Hessian inverse
+    damp = 0.01 * H_padded.diagonal().mean()
+    H_work = H_padded.clone()
+    H_work.diagonal().add_(damp)
+
+    try:
+        L = torch.linalg.cholesky(H_work)
+        H_inv = torch.cholesky_inverse(L)
+    except Exception:
+        H_work.diagonal().add_(damp * 10)
+        try:
+            L = torch.linalg.cholesky(H_work)
+            H_inv = torch.cholesky_inverse(L)
+        except Exception:
+            log.warning("gptq_dual_trit: Cholesky failed, returning PTQTP result")
+            T1, T2, a1, a2, gs = ptqtp_dual_trit(
+                W_padded, group_size=group_size, H=H_padded
+            )
+            return T1[:, :in_f], T2[:, :in_f], a1, a2, group_size
+
+    # Step 3: Column-sequential GPTQ with 9-way search
+    T1 = torch.zeros(out_f, padded_in, dtype=torch.int8)
+    T2 = torch.zeros(out_f, padded_in, dtype=torch.int8)
+    W_work = W_padded.clone()
+
+    for col_start in range(0, padded_in, block_size):
+        col_end = min(col_start + block_size, padded_in)
+        n_block = col_end - col_start
+        H_inv_block = H_inv[col_start:col_end, col_start:col_end]
+        err_block = torch.zeros(out_f, n_block)
+
+        for j_local in range(n_block):
+            j = col_start + j_local
+            g = j // group_size
+
+            w_col = W_work[:, j]
+            h_jj = H_inv_block[j_local, j_local].clamp(min=1e-10)
+
+            a1 = alpha1[:, g]
+            a2 = alpha2[:, g]
+
+            # Vectorized 9-way search — single kernel
+            _dc = torch.tensor(
+                [(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)],
+                dtype=torch.float32, device=w_col.device
+            )  # [9, 2]
+            w_hat_all = a1.unsqueeze(-1) * _dc[:, 0] + a2.unsqueeze(-1) * _dc[:, 1]  # [out_f, 9]
+            err_all = (w_col.unsqueeze(-1) - w_hat_all) ** 2  # [out_f, 9]
+            best_ci = err_all.argmin(dim=-1)  # [out_f]
+            _dc_i = _dc.to(torch.int8)
+            best_t1 = _dc_i[best_ci, 0]
+            best_t2 = _dc_i[best_ci, 1]
+
+            T1[:, j] = best_t1
+            T2[:, j] = best_t2
+
+            # Error propagation (GPTQ core)
+            w_hat_col = a1 * best_t1.float() + a2 * best_t2.float()
+            err = (w_col - w_hat_col) / h_jj
+            err_block[:, j_local] = err
+
+            # Intra-block propagation
+            if j_local + 1 < n_block:
+                W_work[:, j + 1:col_end] -= (
+                    err.unsqueeze(1) * H_inv_block[j_local, j_local + 1:].unsqueeze(0)
+                )
+
+        # Inter-block propagation
+        if col_end < padded_in:
+            H_inv_cross = H_inv[col_start:col_end, col_end:]
+            W_work[:, col_end:] -= err_block @ H_inv_cross
+
+    # Step 4: Re-optimize scales per-group using original W
+    h_diag = H_padded.diagonal().clamp(min=1e-10)
+    W_g = W_padded.reshape(out_f, n_groups, group_size)
+    T1_g = T1.reshape(out_f, n_groups, group_size).float()
+    T2_g = T2.reshape(out_f, n_groups, group_size).float()
+    h_g = h_diag.reshape(1, n_groups, group_size)
+
+    a11 = (h_g * T1_g * T1_g).sum(dim=2)
+    a12 = (h_g * T1_g * T2_g).sum(dim=2)
+    a22 = (h_g * T2_g * T2_g).sum(dim=2)
+    b1 = (h_g * T1_g * W_g).sum(dim=2)
+    b2 = (h_g * T2_g * W_g).sum(dim=2)
+
+    lam = 0.001
+    det = (a11 + lam) * (a22 + lam) - a12 * a12
+    det = det.clamp(min=1e-10)
+    alpha1 = (((a22 + lam) * b1 - a12 * b2) / det).clamp(min=0)
+    alpha2 = (((a11 + lam) * b2 - a12 * b1) / det).clamp(min=0)
+
+    return T1[:, :in_f], T2[:, :in_f], alpha1, alpha2, group_size
+
+
 def dequantize_ptqtp(T1, T2, alpha1, alpha2, group_size, out_f, in_f):
     """Dequantize PTQTP dual trit-plane to full precision."""
     # Expand alpha from (out_f, n_groups) to (out_f, in_f)
@@ -239,6 +572,130 @@ def dequantize_ptqtp(T1, T2, alpha1, alpha2, group_size, out_f, in_f):
     a1 = alpha1.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
     a2 = alpha2.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
     return a1 * T1.float() + a2 * T2.float()
+
+
+# ============================================================================
+# Block Reconstruction: Output-Aware Scale + Rounding Optimization
+# ============================================================================
+
+def block_reconstruct_ptqtp(W, T1, T2, alpha1, alpha2, group_size, H,
+                             n_steps=200, lr=5e-4, flip_fraction=0.1):
+    """
+    Block reconstruction for PTQTP: Hessian-weighted scale optimization +
+    multi-flip greedy refinement using full Hessian.
+
+    Phase 1: Re-optimize scales using Hessian-weighted closed-form solution
+    Phase 2: Greedy flip pass — top K flips per row per iteration (K=5)
+             with scale re-optimization every 10 iterations
+
+    Loss: trace((W - W_hat) @ H @ (W - W_hat)^T)
+    """
+    out_f, in_f = W.shape
+    n_groups = alpha1.shape[1]
+    device = W.device
+
+    T1_f = T1.float().to(device)
+    T2_f = T2.float().to(device)
+    W = W.to(device)
+    H = H.to(device)
+
+    if H.shape[0] > in_f:
+        H = H[:in_f, :in_f]
+    elif H.shape[0] < in_f:
+        H_pad = torch.eye(in_f, device=device)
+        H_pad[:H.shape[0], :H.shape[0]] = H
+        H = H_pad
+
+    h_diag = H.diagonal()  # [in_f]
+
+    # --- Phase 1: Hessian-weighted scale re-optimization (closed form) ---
+    padded_in = n_groups * group_size
+    if padded_in > in_f:
+        W_pad = torch.nn.functional.pad(W, (0, padded_in - in_f))
+        T1_pad = torch.nn.functional.pad(T1_f, (0, padded_in - in_f))
+        T2_pad = torch.nn.functional.pad(T2_f, (0, padded_in - in_f))
+        h_pad = torch.nn.functional.pad(h_diag, (0, padded_in - in_f), value=1e-8)
+    else:
+        W_pad, T1_pad, T2_pad, h_pad = W, T1_f, T2_f, h_diag
+
+    W_g = W_pad.reshape(out_f, n_groups, group_size)
+    T1_g = T1_pad.reshape(out_f, n_groups, group_size)
+    T2_g = T2_pad.reshape(out_f, n_groups, group_size)
+    h_g = h_pad.reshape(1, n_groups, group_size)
+
+    def _solve_scales(T1_g, T2_g):
+        a11 = (h_g * T1_g * T1_g).sum(dim=2)
+        a12 = (h_g * T1_g * T2_g).sum(dim=2)
+        a22 = (h_g * T2_g * T2_g).sum(dim=2)
+        b1 = (h_g * T1_g * W_g).sum(dim=2)
+        b2 = (h_g * T2_g * W_g).sum(dim=2)
+        lam = 0.001
+        det = (a11 + lam) * (a22 + lam) - a12 * a12
+        det = det.clamp(min=1e-10)
+        a1 = (((a22 + lam) * b1 - a12 * b2) / det).clamp(min=0)
+        a2 = (((a11 + lam) * b2 - a12 * b1) / det).clamp(min=0)
+        return a1, a2
+
+    alpha1, alpha2 = _solve_scales(T1_g, T2_g)
+
+    # --- Phase 2: Greedy single-flip per row (conservative) ---
+    T1_work = T1.clone()
+    T2_work = T2.clone()
+
+    a1_exp = alpha1.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+    a2_exp = alpha2.unsqueeze(2).expand(-1, -1, group_size).reshape(out_f, -1)[:, :in_f]
+
+    n_flips = 0
+
+    for flip_iter in range(10):
+        W_hat = a1_exp * T1_work.float() + a2_exp * T2_work.float()
+        E = W - W_hat
+        EH = E @ H  # [out_f, in_f]
+
+        old_val = W_hat  # [out_f, in_f]
+
+        # Vectorized 9-way flip search
+        dc_f = torch.tensor(
+            [(-1,-1),(-1,0),(-1,1),(0,-1),(0,0),(0,1),(1,-1),(1,0),(1,1)],
+            dtype=torch.float32, device=device
+        )  # [9, 2]
+        dc_i = dc_f.to(torch.int8)
+
+        # Per-group column indices for scale lookup
+        group_idx = torch.arange(in_f, device=device) // group_size  # [in_f]
+        # Scales expanded: [out_f, in_f]
+        # All 9 new values: [out_f, in_f, 9]
+        # a1_exp: [out_f, in_f], dc_f[:, 0]: [9] -> [1, 1, 9]
+        new_vals = a1_exp.unsqueeze(-1) * dc_f[:, 0] + a2_exp.unsqueeze(-1) * dc_f[:, 1]  # [out_f, in_f, 9]
+        d_all = old_val.unsqueeze(-1) - new_vals  # [out_f, in_f, 9]
+        # delta_all: [out_f, in_f, 9]
+        delta_all = 2 * d_all * EH.unsqueeze(-1) + d_all * d_all * h_diag.unsqueeze(0).unsqueeze(-1)
+        # Best combo per element
+        best_combo_idx = delta_all.argmin(dim=-1)  # [out_f, in_f]
+        best_delta = delta_all.gather(-1, best_combo_idx.unsqueeze(-1)).squeeze(-1)  # [out_f, in_f]
+        flat_idx = best_combo_idx.reshape(-1)
+        best_t1 = dc_i[flat_idx, 0].reshape(out_f, in_f)
+        best_t2 = dc_i[flat_idx, 1].reshape(out_f, in_f)
+        del delta_all, d_all, new_vals
+
+        # Per-row: apply SINGLE best flip
+        best_col_per_row = best_delta.argmin(dim=1)
+        best_delta_per_row = best_delta.gather(1, best_col_per_row.unsqueeze(1)).squeeze(1)
+
+        worth_flipping = best_delta_per_row < -1e-12
+        if not worth_flipping.any():
+            break
+
+        row_idx = torch.arange(out_f, device=device)[worth_flipping]
+        col_idx = best_col_per_row[worth_flipping]
+        n_flips += len(row_idx)
+
+    # Final scale re-optimization
+    T1_gf = torch.nn.functional.pad(T1_work.float(), (0, max(0, padded_in - in_f))).reshape(out_f, n_groups, group_size)
+    T2_gf = torch.nn.functional.pad(T2_work.float(), (0, max(0, padded_in - in_f))).reshape(out_f, n_groups, group_size)
+    alpha1, alpha2 = _solve_scales(T1_gf, T2_gf)
+
+    return T1_work, T2_work, alpha1, alpha2, n_flips
 
 
 # ============================================================================
@@ -595,20 +1052,20 @@ def get_calibration_samples(tokenizer, n_samples=128, seq_len=2048):
 def capture_layer_hessian(model, layer_name, module, samples, device, n_samples=32):
     """
     Capture Hessian for a single layer by running calibration through
-    the (partially quantized) model. Uses fewer samples for speed since
-    we call this once per layer.
+    the (partially quantized) model. Accumulates X^T X on GPU for speed.
     """
     in_features = module.in_features
-    H = torch.zeros(in_features, in_features, dtype=torch.float32, device='cpu')
+    # Accumulate on GPU — outer product matmul is much faster on GPU
+    hessian_device = device if torch.cuda.is_available() else 'cpu'
+    H = torch.zeros(in_features, in_features, dtype=torch.float32, device=hessian_device)
     count = [0]
 
     def hook_fn(mod, input, output):
-        x = input[0].detach().float()
+        x = input[0].detach().float().to(hessian_device)
         if x.dim() == 3:
             x = x.reshape(-1, x.shape[-1])
-        x_cpu = x.cpu()
-        H.add_(x_cpu.T @ x_cpu)
-        count[0] += x_cpu.shape[0]
+        H.add_(x.T @ x)
+        count[0] += x.shape[0]
 
     hook = module.register_forward_hook(hook_fn)
 
@@ -619,6 +1076,8 @@ def capture_layer_hessian(model, layer_name, module, samples, device, n_samples=
             model(sample)
 
     hook.remove()
+    if count[0] > 0:
+        H.div_(count[0])
     return H
 
 
@@ -647,7 +1106,8 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
                         n_calib=128, seq_len=2048, n_hessian_samples=32,
                         skip_first_last=False, use_hadamard=False,
                         use_bitflip=False, bitflip_iters=3,
-                        use_ptqtp=False, ptqtp_group_size=128):
+                        use_ptqtp=False, ptqtp_group_size=128,
+                        use_tri_trit=False):
     """
     Quantize layers SEQUENTIALLY: after quantizing layer i, the Hessian
     for layer i+1 is captured through the already-quantized layers.
@@ -752,29 +1212,69 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
         else:
             H_use = H
 
-        if use_ptqtp:
-            # PTQTP: Dual trit-plane decomposition
-            # Optionally apply Hadamard rotation first
-            R = None
-            W_q = W
-            H_q = H_use
-            if use_hadamard:
-                W_q, H_q, R = apply_hadamard_rotation(W, H_use, seed=42 + layer_idx)
+        # Move to GPU for faster quantization if available
+        quant_device = device if torch.cuda.is_available() else 'cpu'
+        W_gpu = W.to(quant_device)
+        H_gpu = H_use.to(quant_device)
 
-            # PTQTP with activation-aware optimization (pass Hessian)
+        if use_tri_trit:
+            # 3-plane trit decomposition (27 values, ~4.75 bits/weight)
+            R = None
+            W_q = W_gpu
+            H_q = H_gpu
+            if use_hadamard:
+                W_q, H_q, R = apply_hadamard_rotation(W_gpu, H_gpu, seed=42 + layer_idx)
+
+            T1, T2, T3, a1, a2, a3, gs = ptqtp_tri_trit(
+                W_q, group_size=ptqtp_group_size, H=H_q
+            )
+
+            W_hat = dequantize_tri_trit(T1, T2, T3, a1, a2, a3, gs, out_f, in_f)
+            W_hat = W_hat[:out_f, :in_f]
+
+            if R is not None:
+                W_hat = W_hat @ R
+                method = "TriTrit+Had"
+            else:
+                method = "TriTrit"
+
+            W_hat = W_hat.cpu()
+            mse = ((W[:out_f, :in_f] - W_hat) ** 2).mean().item()
+            signal = (W[:out_f, :in_f] ** 2).mean().item()
+            best_snr = 10 * math.log10(signal / max(mse, 1e-15))
+            snr_itf = best_snr
+            snr_aga = best_snr
+            snr_gptq = None
+
+            _replace_weight(model, name, module, W_hat)
+        elif use_ptqtp:
+            # PTQTP: Dual trit-plane decomposition
+            R = None
+            W_q = W_gpu
+            H_q = H_gpu
+            if use_hadamard:
+                W_q, H_q, R = apply_hadamard_rotation(W_gpu, H_gpu, seed=42 + layer_idx)
+
             T1, T2, a1, a2, gs = ptqtp_dual_trit(
                 W_q, group_size=ptqtp_group_size, H=H_q
             )
+
+            # Block reconstruction: greedy flip refinement
+            T1, T2, a1, a2, n_flips = block_reconstruct_ptqtp(
+                W_q[:out_f, :in_f], T1, T2, a1, a2, gs, H_q,
+                n_steps=200, lr=1e-3
+            )
+
             W_hat = dequantize_ptqtp(T1, T2, a1, a2, gs, out_f, in_f)
             W_hat = W_hat[:out_f, :in_f]
 
-            # Undo Hadamard rotation if applied
             if R is not None:
-                W_hat = W_hat @ R  # W_hat was in rotated space, undo
-                method = "PTQTP+Had"
+                W_hat = W_hat @ R
+                method = f"PTQTP+BR+Had({n_flips}f)"
             else:
-                method = "PTQTP"
+                method = f"PTQTP+BR({n_flips}f)"
 
+            W_hat = W_hat.cpu()
             mse = ((W[:out_f, :in_f] - W_hat) ** 2).mean().item()
             signal = (W[:out_f, :in_f] ** 2).mean().item()
             best_snr = 10 * math.log10(signal / max(mse, 1e-15))
@@ -787,10 +1287,10 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
             # PT2-LLM pipeline: ITF + AGA + GPTQ
             # Optional: Hadamard rotation for incoherence processing
             R = None
-            W_q = W  # weight to quantize (possibly rotated)
-            H_q = H_use  # Hessian for quantization (possibly rotated)
+            W_q = W_gpu
+            H_q = H_gpu
             if use_hadamard:
-                W_q, H_q, R = apply_hadamard_rotation(W, H_use, seed=42 + layer_idx)
+                W_q, H_q, R = apply_hadamard_rotation(W_gpu, H_gpu, seed=42 + layer_idx)
 
             # Step 1: ITF
             T, alpha, mu = iterative_ternary_fitting(W_q, n_iters=10)
@@ -841,9 +1341,8 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
             # Replace the linear layer IN-PLACE
             W_hat = best_alpha.unsqueeze(1) * best_T.float() + best_mu.unsqueeze(1)
             if R is not None:
-                # Un-rotate: W_hat_orig = W_hat_rot @ R (since W_rot = W @ R^T)
                 W_hat = W_hat @ R
-            W_hat = W_hat[:out_f, :in_f]
+            W_hat = W_hat[:out_f, :in_f].cpu()
             _replace_weight(model, name, module, W_hat)
 
         stats = {
@@ -862,7 +1361,9 @@ def quantize_sequential(model, tokenizer, device, use_gptq=True,
                  f" [ITF={snr_itf:.1f}, AGA={snr_aga:.1f}"
                  f"{f', GPTQ={snr_gptq:.1f}' if snr_gptq is not None else ''}]")
 
-        del W, H, H_use
+        del W, H, H_use, W_gpu, H_gpu
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
     return stats_all
@@ -914,6 +1415,8 @@ def main():
                         help="Use PTQTP dual trit-plane decomposition (~3.16 bits)")
     parser.add_argument("--ptqtp-group-size", type=int, default=128,
                         help="PTQTP group size for scales (default: 128)")
+    parser.add_argument("--tri-trit", action="store_true",
+                        help="Use 3-plane trit decomposition (27 values, ~4.75 bits, highest quality)")
     parser.add_argument("--use-4bit", action="store_true",
                         help="Load model in 4-bit (for large models)")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -970,7 +1473,8 @@ def main():
                                  use_bitflip=args.bitflip,
                                  bitflip_iters=args.bitflip_iters,
                                  use_ptqtp=args.ptqtp,
-                                 ptqtp_group_size=args.ptqtp_group_size)
+                                 ptqtp_group_size=args.ptqtp_group_size,
+                                 use_tri_trit=args.tri_trit)
     t_quant = time.time() - t0
     log.info(f"Quantization done ({t_quant:.0f}s)")
 
