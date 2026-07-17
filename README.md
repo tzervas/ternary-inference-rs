@@ -1,5 +1,10 @@
 # ternary-inference-rs
 
+<!-- FLEET-BADGES:BEGIN -->
+[![CI](https://github.com/tzervas/ternary-inference-rs/actions/workflows/fleet-ci.yml/badge.svg?branch=main)](https://github.com/tzervas/ternary-inference-rs/actions/workflows/fleet-ci.yml?query=branch%3Amain)
+[![Security](https://github.com/tzervas/ternary-inference-rs/actions/workflows/fleet-security.yml/badge.svg?branch=main)](https://github.com/tzervas/ternary-inference-rs/actions/workflows/fleet-security.yml?query=branch%3Amain)
+<!-- FLEET-BADGES:END -->
+
 GPU-accelerated inference engine for BitNet 1.58-bit ternary models in Rust.
 
 Runs natively-trained 1.58-bit models like [microsoft/bitnet-b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) on consumer GPUs with minimal VRAM.
